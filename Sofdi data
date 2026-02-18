@@ -1,0 +1,211 @@
+## Full robust Kobo → flat-wide dataset script
+## Replace credentials before running:
+kob_user <- "***"
+kob_pass <- "****"
+
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(janitor)
+library(purrr)
+library(tibble)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+
+# Helper: expand a repeat-type list-column into wide indexed columns
+expand_repeat_column <- function(col_values, colname) {
+  n <- length(col_values)
+  # find inner field names (for data.frames or list-of-named-lists)
+  inner_names <- unique(unlist(
+    lapply(col_values, function(v) {
+      if (is.null(v)) return(NULL)
+      if (is.data.frame(v)) return(names(v))
+      if (is.list(v) && length(v) > 0 && is.list(v[[1]])) return(names(v[[1]]))
+      if (is.list(v) && length(v) > 0 && !is.list(v[[1]])) return(NULL)
+      return(NULL)
+    })
+  ))
+  # max repeat count
+  max_len <- max(sapply(col_values, function(v) {
+    if (is.null(v)) return(0)
+    if (is.data.frame(v)) return(nrow(v))
+    if (is.list(v)) return(length(v))
+    if (is.atomic(v)) return(length(v))
+    return(0)
+  }), na.rm = TRUE)
+  
+  out <- list()
+  if (max_len == 0) return(tibble())
+  
+  for (j in seq_len(max_len)) {
+    if (length(inner_names) > 0) {
+      for (inner in inner_names) {
+        vec <- vector("list", n)
+        for (i in seq_len(n)) {
+          v <- col_values[[i]]
+          val <- NA
+          if (!is.null(v)) {
+            if (is.data.frame(v)) {
+              if (nrow(v) >= j && inner %in% names(v)) val <- v[[inner]][j]
+            } else if (is.list(v) && length(v) >= j && is.list(v[[j]]) && inner %in% names(v[[j]])) {
+              val <- v[[j]][[inner]]
+            } else if (is.atomic(v) && length(v) >= j && inner == "") {
+              val <- v[j]
+            }
+          }
+          vec[[i]] <- if (is.null(val)) NA else val
+        }
+        cname <- paste0(colname, "_", j, "_", inner)
+        out[[cname]] <- vec
+      }
+    } else {
+      # no inner names → treat repeats as atomic values
+      vec <- vector("list", n)
+      for (i in seq_len(n)) {
+        v <- col_values[[i]]
+        if (is.null(v) || length(v) < j) vec[[i]] <- NA else vec[[i]] <- v[[j]]
+      }
+      cname <- paste0(colname, "_", j)
+      out[[cname]] <- vec
+    }
+  }
+  
+  # convert list columns to atomic vectors where possible
+  out <- map_df(out, ~ {
+    # try to simplify to atomic vector where safe
+    if (all(map_lgl(.x, function(z) length(z) <= 1))) {
+      unlist(.x)
+    } else {
+      # keep list column
+      .x
+    }
+  })
+  return(out)
+}
+
+# Helper: flatten any list-columns in a tibble (including repeats -> wide indexed columns)
+flatten_kobo <- function(dat) {
+  if (!is_tibble(dat)) dat <- as_tibble(dat)
+  # loop until no list-columns remain
+  repeat {
+    list_cols <- names(dat)[vapply(dat, is.list, logical(1))]
+    if (length(list_cols) == 0) break
+    
+    # process first list column found (iterate one by one)
+    col <- list_cols[[1]]
+    col_values <- dat[[col]]
+    
+    # case A: simple scalar-in-list (each element atomic length 1 or NULL) -> simplify
+    if (all(vapply(col_values, function(x) is.null(x) || (is.atomic(x) && length(x) <= 1), logical(1)))) {
+      dat[[col]] <- vapply(col_values, function(x) if (is.null(x)) NA else x[[1]], FUN.VALUE = NA_character_)
+      next
+    }
+    
+    # case B: complex repeats -> expand into wide indexed columns
+    newcols <- expand_repeat_column(col_values, col)
+    if (ncol(newcols) == 0) {
+      # if expansion failed, convert to JSON strings as last resort
+      dat[[col]] <- vapply(col_values, function(x) if (is.null(x)) NA_character_ else toJSON(x, auto_unbox = TRUE), FUN.VALUE = NA_character_)
+      next
+    }
+    
+    # bind new columns and remove original list column
+    dat <- bind_cols(dat %>% select(-all_of(col)), newcols)
+  }
+  
+  # finally clean names
+  dat <- janitor::clean_names(dat)
+  return(as_tibble(dat))
+}
+
+# Main: fetch all deployments for a given form name and unify into a wide flat dataset
+get_kobo_data_all_versions <- function(form_name, user, pass, asset_list_url = "https://kf.kobotoolbox.org/api/v2/assets/") {
+  # list assets
+  forms_req <- GET(url = asset_list_url, authenticate(user, pass))
+  stop_for_status(forms_req)
+  forms_list <- fromJSON(content(forms_req, "text", encoding = "UTF-8"), flatten = TRUE)
+  forms_df <- as.data.frame(forms_list$results)
+  
+  # find matching assets (deployments)
+  target <- forms_df %>%
+    filter(name == form_name) %>%
+    select(name, uid, data, version_id, date_deployed, date_modified)
+  
+  if (nrow(target) == 0) stop("Form not found. Run names(forms_df) to inspect available fields and names.")
+  
+  message("Found ", nrow(target), " deployments for form '", form_name, "'")
+  
+  all_versions <- list()
+  for (i in seq_len(nrow(target))) {
+    data_url <- as.character(target$data[i])
+    ver_id <- as.character(target$version_id[i])
+    message("Fetching version ", ver_id, " -> ", data_url)
+    
+    sub_req <- GET(data_url, authenticate(user, pass))
+    if (status_code(sub_req) != 200) {
+      warning("HTTP ", status_code(sub_req), " when fetching ", data_url)
+      next
+    }
+    sub_text <- content(sub_req, "text", encoding = "UTF-8")
+    sub_json <- fromJSON(sub_text, flatten = TRUE)
+    
+    # handle two possible shapes: a) direct array of submissions, b) object with results
+    if (is.list(sub_json) && "results" %in% names(sub_json)) {
+      dat_raw <- as_tibble(sub_json$results)
+    } else if (is.data.frame(sub_json) || (is.list(sub_json) && length(sub_json) > 0 && is.atomic(sub_json[[1]]))) {
+      dat_raw <- as_tibble(sub_json)
+    } else {
+      # fallback: try to coerce into tibble
+      dat_raw <- tryCatch(as_tibble(sub_json), error = function(e) tibble())
+    }
+    
+    if (nrow(dat_raw) == 0) {
+      message("No submissions for version ", ver_id)
+      next
+    }
+    
+    # flatten list-columns (including repeats)
+    dat_flat <- flatten_kobo(dat_raw)
+    # tag version using a safe column name
+    dat_flat[["kobo_version_id"]] <- ver_id
+    all_versions[[length(all_versions) + 1]] <- dat_flat
+  }
+  
+  if (length(all_versions) == 0) {
+    message("No submissions across any deployment.")
+    return(tibble())
+  }
+  
+  # unify columns across versions (fill missing columns with NA)
+  all_cols <- unique(unlist(map(all_versions, names)))
+  all_versions <- map(all_versions, ~{
+    missing <- setdiff(all_cols, names(.x))
+    if (length(missing) > 0) .x <- add_column(.x, !!!setNames(vector("list", length(missing)), missing))
+    # ensure column order consistent
+    .x[all_cols]
+  })
+  
+  dat_master <- bind_rows(all_versions)
+  # ensure clean names once more
+  dat_master <- clean_names(dat_master)
+  return(dat_master)
+}
+
+## -----------------------
+## USAGE
+## -----------------------
+form_name <- "Termite Research"
+Sofdi_termite_data <- get_kobo_data_all_versions(form_name, kob_user, kob_pass)
+
+# quick checks
+dim(Sofdi_termite_data)
+glimpse(Sofdi_termite_data)
+colnames(Sofdi_termite_data)
+View(Sofdi_termite_data)
+
+# optionally write to CSV
+# write.csv(Sofdi_termite_data, "termite_data_master.csv", row.names = FALSE)
+
+
