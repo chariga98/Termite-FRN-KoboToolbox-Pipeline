@@ -1,0 +1,144 @@
+library(dplyr)
+
+farmer_list_sofdi <- Sofdi_termite_data %>%
+  group_by(farmer_name, clusters) %>%
+  arrange(today) %>%
+  summarise(
+    organization       = first(na.omit(organization)),
+    subcounty          = first(na.omit(subcounty)),
+    gender             = first(na.omit(gender)),
+    age_range          = first(na.omit(age_range)),
+    contact            = first(na.omit(contact)),
+    attended_workshop  = first(na.omit(attended_workshop)),
+    .groups = "drop"
+  ) %>%
+  # remove unwanted rows
+  filter(
+    !is.na(farmer_name),
+    !tolower(farmer_name) %in% c("korwa_a","naora")
+  ) %>%
+  arrange(organization, subcounty, clusters, farmer_name)
+
+# View clean result
+print(farmer_list_sofdi)
+
+# View result
+print(farmer_list_sofdi)
+View(farmer_list_sofdi)
+
+
+########################################
+#########################################
+##Combined dataset
+
+# Combine the two datasets
+all_farmers <- bind_rows(farmer_list, farmer_list_sofdi)
+
+
+
+# View combined data
+print(all_farmers)
+View(all_farmers)
+
+
+###############################################
+####################################################
+##Xlxs list
+library(openxlsx)
+
+# Keep only the key columns and arrange in professional order
+farmer_share <- all_farmers %>%
+  select(farmer_name, organization, subcounty, clusters) %>%
+  arrange(organization, subcounty, clusters, farmer_name)
+
+# Export to Excel
+write.xlsx(farmer_share, "Termite_Farmer_List_Shared.xlsx", overwrite = TRUE)
+
+# Optional preview
+View(farmer_share)
+
+#########################################################
+###################################################
+##Table formart
+library(gt)
+library(htmltools)
+library(pagedown)
+
+# ---------------------------
+# 1️⃣ Prepare data
+# ---------------------------
+farmer_share <- all_farmers %>%
+  select(farmer_name, organization, subcounty, clusters) %>%
+  arrange(organization, subcounty, clusters, farmer_name) %>%
+  mutate(Farmer_No = row_number()) %>%       # Add sequential number
+  select(Farmer_No, everything())           # Put number first
+
+# ---------------------------
+# 2️⃣ Pagination
+# ---------------------------
+page_size <- 25
+n_pages <- ceiling(nrow(farmer_share) / page_size)
+
+# ---------------------------
+# 3️⃣ Generate HTML tables with full width and page breaks
+# ---------------------------
+tables_list <- lapply(1:n_pages, function(i) {
+  start <- (i - 1) * page_size + 1
+  end <- min(i * page_size, nrow(farmer_share))
+  page_data <- farmer_share[start:end, ]
+  
+  table <- gt(page_data) %>%
+    tab_header(
+      title = md("**Termite Farmer List**"),
+      subtitle = paste("Page", i, "of", n_pages)
+    ) %>%
+    tab_options(
+      table.font.size = 12,
+      heading.background.color = "#f7f7f7",
+      column_labels.background.color = "#e0f0e0",
+      column_labels.font.weight = "bold",
+      row.striping.include_table_body = TRUE,
+      table.border.top.color = "gray",
+      table.border.bottom.color = "gray",
+      data_row.padding = px(6)
+    ) %>%
+    as_raw_html()
+  
+  # Wrap table in div with minimal margin, full width, seamless background
+  htmltools::tags$div(
+    table,
+    style = paste(
+      "page-break-after: always;",
+      "margin: 10px 15px;",    # 10px top/bottom, 15px sides
+      "width: calc(100% - 30px);",  # nearly full width minus side margins
+      "background-color: white;"     # seamless page background
+    )
+  )
+})
+
+# ---------------------------
+# 4️⃣ Combine into single HTML
+# ---------------------------
+combined_html <- htmltools::browsable(htmltools::tagList(tables_list))
+html_file <- "Termite_Farmer_List_FullWidth.html"
+htmltools::save_html(combined_html, file = html_file)
+
+# ---------------------------
+# 5️⃣ Convert HTML to PDF (A4, small margins, seamless)
+# ---------------------------
+pagedown::chrome_print(
+  input = html_file,
+  output = "Termite_Farmer_List_FullWidth.pdf",
+  format = "pdf",
+  extra_args = c(
+    "--print-backgrounds",
+    "--paper-width=8.27in",
+    "--paper-height=11.69in",
+    "--margin-top=15mm",
+    "--margin-bottom=15mm",
+    "--margin-left=10mm",
+    "--margin-right=10mm"
+  )
+)
+
+message("✅ PDF created: Termite_Farmer_List_FullWidth.pdf")
