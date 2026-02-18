@@ -1,0 +1,570 @@
+############################################
+## MULTI-KOBO → FLAT WIDE DATA 
+############################################
+
+## -----------------------
+## LIBRARIES
+## -----------------------
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(janitor)
+library(purrr)
+library(tibble)
+library(lubridate)
+library(openxlsx)
+## -----------------------
+## HELPER: SAFE EXPAND REPEAT
+## -----------------------
+expand_repeat_column <- function(col_values, colname) {
+  n <- length(col_values)
+  
+  inner_names <- unique(unlist(
+    lapply(col_values, function(v) {
+      if (is.null(v)) return(NULL)
+      if (is.data.frame(v)) return(names(v))
+      if (is.list(v) && length(v) > 0 && is.list(v[[1]])) return(names(v[[1]]))
+      NULL
+    })
+  ))
+  
+  max_len <- max(sapply(col_values, function(v) {
+    if (is.null(v)) return(0)
+    if (is.data.frame(v)) return(nrow(v))
+    if (is.list(v)) return(length(v))
+    0
+  }), na.rm = TRUE)
+  
+  if (max_len == 0) return(tibble())
+  
+  out <- list()
+  
+  for (j in seq_len(max_len)) {
+    if (length(inner_names) > 0) {
+      for (inner in inner_names) {
+        vec <- vector("list", n)
+        
+        for (i in seq_len(n)) {
+          v <- col_values[[i]]
+          value <- NA
+          
+          if (!is.null(v)) {
+            if (is.data.frame(v) &&
+                nrow(v) >= j &&
+                inner %in% names(v)) {
+              value <- v[[inner]][j]
+            } else if (is.list(v) &&
+                       length(v) >= j &&
+                       is.list(v[[j]]) &&
+                       inner %in% names(v[[j]])) {
+              value <- v[[j]][[inner]]
+            }
+          }
+          
+          vec[[i]] <- value
+        }
+        
+        out[[paste0(colname, "_", j, "_", inner)]] <- unlist(vec)
+      }
+    } else {
+      vec <- vector("list", n)
+      for (i in seq_len(n)) {
+        v <- col_values[[i]]
+        vec[[i]] <- if (!is.null(v) && length(v) >= j) v[[j]] else NA
+      }
+      out[[paste0(colname, "_", j)]] <- unlist(vec)
+    }
+  }
+  
+  as_tibble(out)
+}
+
+## -----------------------
+## HELPER: FLATTEN KOBO DATA
+## -----------------------
+flatten_kobo <- function(dat) {
+  dat <- as_tibble(dat)
+  
+  repeat {
+    list_cols <- names(dat)[vapply(dat, is.list, logical(1))]
+    if (length(list_cols) == 0) break
+    
+    col <- list_cols[1]
+    expanded <- expand_repeat_column(dat[[col]], col)
+    
+    if (ncol(expanded) == 0) {
+      dat[[col]] <- map_chr(
+        dat[[col]],
+        ~ if (is.null(.x)) NA_character_ else toJSON(.x, auto_unbox = TRUE)
+      )
+    } else {
+      dat <- bind_cols(select(dat, -all_of(col)), expanded)
+    }
+  }
+  
+  clean_names(dat)
+}
+
+## -----------------------
+## MAIN: FETCH KOBO DATA
+## -----------------------
+get_kobo_data_all_versions <- function(
+    form_name,
+    user,
+    pass,
+    asset_url = "https://kf.kobotoolbox.org/api/v2/assets/"
+) {
+  
+  assets <- GET(asset_url, authenticate(user, pass))
+  stop_for_status(assets)
+  
+  assets_df <- fromJSON(
+    content(assets, "text", encoding = "UTF-8"),
+    flatten = TRUE
+  )$results %>% as_tibble()
+  
+  targets <- assets_df %>%
+    filter(name == form_name) %>%
+    select(data, version_id)
+  
+  if (nrow(targets) == 0) stop("Form not found: ", form_name)
+  
+  versions <- list()
+  
+  for (i in seq_len(nrow(targets))) {
+    res <- GET(targets$data[i], authenticate(user, pass))
+    if (status_code(res) != 200) next
+    
+    raw <- fromJSON(
+      content(res, "text", encoding = "UTF-8"),
+      flatten = TRUE
+    )
+    
+    raw <- if ("results" %in% names(raw)) raw$results else raw
+    if (length(raw) == 0) next
+    
+    flat <- flatten_kobo(raw)
+    flat$kobo_version_id <- targets$version_id[i]
+    
+    versions[[length(versions) + 1]] <- flat
+  }
+  
+  bind_rows(versions)
+}
+
+## -----------------------
+## KOBO SOURCES (CONFIG)
+## -----------------------
+kobo_sources <- tibble(
+  source = c(
+    "RFRN_Tembea","SOFDI","ShortRain_2025"
+  ),
+  user   = c(
+    "ae_hub_ea","sofdi","ae_hub_ea"
+  ),
+  pass   = c(
+    "masenomathscamp","sofdi2024","masenomathscamp"
+  ),
+  form   = c(
+    "Termite Research (Tembea & RFRN Version)","Termite Research","Termite Short Rain 2025"
+  )
+)
+
+
+## -----------------------
+## FETCH ALL SOURCES
+## -----------------------
+kobo_list <- kobo_sources %>%
+  mutate(
+    data = pmap(
+      list(form, user, pass),
+      get_kobo_data_all_versions
+    )
+  ) %>%
+  select(source, data) %>%
+  deframe()
+
+## -----------------------
+## FINAL DATA OBJECTS
+## -----------------------
+RFRN_Tembea    <- kobo_list$RFRN_Tembea
+SOFDI          <- kobo_list$SOFDI
+ShortRain_2025 <-kobo_list$ShortRain_2025
+## -----------------------
+## COMBINED LONGRAIN DATA
+## -----------------------
+Longrain_2025_master <- bind_rows(
+  RFRN_Tembea %>% mutate(source = "RFRN_Tembea"),
+  SOFDI       %>% mutate(source = "SOFDI")
+)
+##--------------------------------
+## SOFDI SHORTRAIN DATA
+##-------------------------------
+Longrain_2025_master <- Longrain_2025_master%>%
+  rename(Collection_Date         = today)
+# 1. Make sure the date column is a proper Date
+Longrain_2025_master <- Longrain_2025_master %>%
+  mutate(Collection_Date = as.Date(Collection_Date))
+
+# 2. Create subset for November onward
+SOFDI_shortrain <- Longrain_2025_master %>%
+  filter(month(Collection_Date) >= 11)
+
+# 3. Keep only January–October data in main dataset
+Longrain_2025_master <- Longrain_2025_master %>%
+  filter(month(Collection_Date) < 11)
+
+##----------------------
+## SELECT KEY COLS
+##----------------------
+####
+##-------------------
+##Merge helper colums to main colums
+##----------------
+Longrain_2025_master <- Longrain_2025_master %>%
+  mutate(
+    farmer_name   = coalesce(farmer_name, farmer_name_other),
+    datacollector = coalesce(datacollector, other_datacollector_name),
+    
+    mound_termites = if_else(
+      !is.na(other_mound_termite) & trimws(other_mound_termite) != "",
+      other_mound_termite,
+      mound_termites
+    )
+  ) %>%
+  select(-farmer_name_other, -other_datacollector_name, -other_mound_termite)%>%
+  rename(
+         "Plot_1_name_'Vigour'"  = "vigour_repeat_1_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_1_Vigour"         = "vigour_repeat_1_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_2_name_'Vigour'"  = "vigour_repeat_2_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_2_Vigour"         = "vigour_repeat_2_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_3_name_'Vigour'"  = "vigour_repeat_3_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_3_Vigour"         = "vigour_repeat_3_vigour_repeat_plant_vigour_for_each_plot" ,                                   
+         "Plot_4_name_'Vigour'"  = "vigour_repeat_4_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_4_Vigour"         = "vigour_repeat_4_vigour_repeat_plant_vigour_for_each_plot",
+         "Plot_1_name_'Size'"    = "plots_repeat_1_plots_repeat_plot_name" ,                                                      
+         "Plot_1_Size"           = "plots_repeat_1_plots_repeat_plot_sizes"  ,                                                    
+         "Plot_2_name_'Size'"    =  "plots_repeat_2_plots_repeat_plot_name" ,                                                      
+         "Plot_2_Size"           = "plots_repeat_2_plots_repeat_plot_sizes" ,                                                     
+         "Plot_3_name_'Size'"    = "plots_repeat_3_plots_repeat_plot_name"  ,                                                     
+         "Plot_3_Size"                    = "plots_repeat_3_plots_repeat_plot_sizes" ,                                                     
+         "Plot_4_name_'Size'"             = "plots_repeat_4_plots_repeat_plot_name",                                                       
+         "Plot_4_Size"                    = "plots_repeat_4_plots_repeat_plot_sizes" ,
+         "Plot_1_name_'Crop.Planted'"     = "plot_planting_repeat_1_plot_planting_repeat_plot_planting_name" ,                             
+         "Plot_1_maize.Planted"           = "plot_planting_repeat_1_plot_planting_repeat_date_maize_planted",                              
+         "Plot_1_CoverCrop.Planted"       = "plot_planting_repeat_1_plot_planting_repeat_date_cover_crop_planted",                         
+         "Plot_2_name_'Crop.Planted'"     = "plot_planting_repeat_2_plot_planting_repeat_plot_planting_name"  ,                            
+         "Plot_2_maize.Planted"           = "plot_planting_repeat_2_plot_planting_repeat_date_maize_planted" ,                             
+         "Plot_2_CoverCrop.Planted"       = "plot_planting_repeat_2_plot_planting_repeat_date_cover_crop_planted",                         
+         "Plot_3_name_'Crop.Planted'"     = "plot_planting_repeat_3_plot_planting_repeat_plot_planting_name" ,                             
+         "Plot_3_maize.Planted"           = "plot_planting_repeat_3_plot_planting_repeat_date_maize_planted" ,                             
+         "Plot_3_CoverCrop.Planted"       = "plot_planting_repeat_3_plot_planting_repeat_date_cover_crop_planted" ,                        
+         "Plot_4_name_'Crop.Planted'"     = "plot_planting_repeat_4_plot_planting_repeat_plot_planting_name" ,                             
+         "Plot_4_maize.Planted"           = "plot_planting_repeat_4_plot_planting_repeat_date_maize_planted" ,                             
+         "Plot_4_CoverCrop.Planted"       = "plot_planting_repeat_4_plot_planting_repeat_date_cover_crop_planted" ,
+         "Plot_1_name_'Emmergence'"       = "emmergence_repeat_1_emmergence_repeat_emmergence_name" ,                                      
+         "Plot_1_Emmergence"              = "emmergence_repeat_1_emmergence_repeat_emmergence"       ,                                     
+         "Plot_2_name_'Emmergence'"       = "emmergence_repeat_2_emmergence_repeat_emmergence_name"   ,                                    
+         "Plot_2_Emmergence"              = "emmergence_repeat_2_emmergence_repeat_emmergence"         ,                                   
+         "Plot_3_name_'Emmergence'"       = "emmergence_repeat_3_emmergence_repeat_emmergence_name"     ,                                  
+         "Plot_3_Emmergence"              =  "emmergence_repeat_3_emmergence_repeat_emmergence"          ,                                  
+         "Plot_4_name_'Emmergence'"       = "emmergence_repeat_4_emmergence_repeat_emmergence_name"       ,                                
+         "Plot_4_Emmergence"              = "emmergence_repeat_4_emmergence_repeat_emmergence" ,
+         "Plot_1_name_'first.weeding.Not.Same'"        = "plots_weeded_repeat_1_plots_weeded_repeat_plots_weeded_name",                                 
+         "Plot_1_First.weeding.Date"                   = "plots_weeded_repeat_1_plots_weeded_repeat_plot_weeding_date" ,                                
+         "Plot_2_name_'first.weeding.Not.Same'"        = "plots_weeded_repeat_2_plots_weeded_repeat_plots_weeded_name" ,                                
+         "Plot_2_First.weeding.Date"                   =  "plots_weeded_repeat_2_plots_weeded_repeat_plot_weeding_date",                                 
+         "Plot_3_name_'first.weeding.Not.Same'"        = "plots_weeded_repeat_3_plots_weeded_repeat_plots_weeded_name" ,                                
+         "Plot_3_First.weeding.Date"                   = "plots_weeded_repeat_3_plots_weeded_repeat_plot_weeding_date",                                 
+         "Plot_4_name_'first.weeding.Not.Same'"        = "plots_weeded_repeat_4_plots_weeded_repeat_plots_weeded_name" ,                                
+         "Plot_4_First.weeding.Date"                   = "plots_weeded_repeat_4_plots_weeded_repeat_plot_weeding_date" ,
+         "Plot_1_name_'Attack.at.First.Weeding'"                  = "first_weeding_repaet_1_first_weeding_repaet_first_weeding_name"  ,                            
+         "Plot_1_Population.Reduction.First.Weeding"              = "first_weeding_repaet_1_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+         "Plot_2_name_'Attack.at.First.Weeding'"                  = "first_weeding_repaet_2_first_weeding_repaet_first_weeding_name"   ,                           
+         "Plot_2_Population.Reduction.First.Weeding"              = "first_weeding_repaet_2_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+         "Plot_3_name_'Attack.at.First.Weeding'"                  = "first_weeding_repaet_3_first_weeding_repaet_first_weeding_name",            
+         "Plot_3_Population.Reduction.First.Weeding"              = "first_weeding_repaet_3_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+         "Plot_4_name_'Attack.at.First.Weeding'"                  = "first_weeding_repaet_4_first_weeding_repaet_first_weeding_name"               ,               
+         "Plot_4_Population.Reduction.First.Weeding"              = "first_weeding_repaet_4_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+         "Plot_1_name_'Attack.at.Second.Weeding'"                 =  "second_weeding_repeat_1_second_weeding_repeat_second_weeding_name" ,                          
+         "Plot_1_Population.Reduction.Second.Weeding"             =  "second_weeding_repeat_1_second_weeding_repeat_plot_reduced_pop_after_second_weeding" ,        
+         "Plot_2_name_'Attack.at.Second.Weeding'"                 =  "second_weeding_repeat_2_second_weeding_repeat_second_weeding_name",                           
+         "Plot_2_Population.Reduction.Second.Weeding"             =  "second_weeding_repeat_2_second_weeding_repeat_plot_reduced_pop_after_second_weeding" ,        
+         "Plot_3_name_'Attack.at.Second.Weeding'"                 =  "second_weeding_repeat_3_second_weeding_repeat_second_weeding_name"     ,                      
+         "Plot_3_Population.Reduction.Second.Weeding"             =  "second_weeding_repeat_3_second_weeding_repeat_plot_reduced_pop_after_second_weeding" ,        
+         "Plot_4_name_'Attack.at.Second.Weeding'"                 =  "second_weeding_repeat_4_second_weeding_repeat_second_weeding_name"  ,                         
+         "Plot_4_Population.Reduction.Second.Weeding"             =  "second_weeding_repeat_4_second_weeding_repeat_plot_reduced_pop_after_second_weeding"   ,
+         "Plot_1_name_'Attack.at.Tasseling'"              =  "tasseling_repeat_1_tasseling_repeat_tasseling_pop_name" ,                                     
+         "Plot_1_Population.Reduction.Tasseling"          =  "tasseling_repeat_1_tasseling_repeat_pop_reduction_at_tasseling" ,                             
+         "Plot_2_name_'Attack.at.Tasseling'"              =  "tasseling_repeat_2_tasseling_repeat_tasseling_pop_name"     ,                                 
+         "Plot_2_Population.Reduction.Tasseling"          =  "tasseling_repeat_2_tasseling_repeat_pop_reduction_at_tasseling" ,                             
+         "Plot_3_name_'Attack.at.Tasseling'"              =  "tasseling_repeat_3_tasseling_repeat_tasseling_pop_name"   ,                                   
+         "Plot_3_Population.Reduction.Tasseling"          =  "tasseling_repeat_3_tasseling_repeat_pop_reduction_at_tasseling" ,                             
+         "Plot_4_name_'Attack.at.Tasseling'"              =  "tasseling_repeat_4_tasseling_repeat_tasseling_pop_name" ,                                     
+         "Plot_4_Population.Reduction.Tasseling"          =  "tasseling_repeat_4_tasseling_repeat_pop_reduction_at_tasseling",
+                                         
+         "Plot_1_name_'Attack.at.Harvesting'"             = "loss_harvest_repeat_1_loss_harvest_repeat_loss_harvest_name" ,                                
+         "Plot_1_Population.Reduction.Harvesting"         = "loss_harvest_repeat_1_loss_harvest_repeat_pop_harvesting"  ,                                  
+         "Plot_2_name_'Attack.at.Harvesting'"             = "loss_harvest_repeat_2_loss_harvest_repeat_loss_harvest_name",                                 
+         "Plot_2_Population.Reduction.Harvesting"         = "loss_harvest_repeat_2_loss_harvest_repeat_pop_harvesting",                                    
+         "Plot_3_name_'Attack.at.Harvesting'"             = "loss_harvest_repeat_3_loss_harvest_repeat_loss_harvest_name",                                 
+         "Plot_3_Population.Reduction.Harvesting"         = "loss_harvest_repeat_3_loss_harvest_repeat_pop_harvesting",
+                             
+         "Location_1_Termite_attacked"    =  "location_termite_repeat_1_location_termite_repeat_location_termite_name"  ,                   
+         "Location_1_Termite_Name"        = "location_termite_repeat_1_location_termite_repeat_termite_type_name"  ,                       
+         "Location_2_Termite_attacked"    =   "location_termite_repeat_2_location_termite_repeat_location_termite_name"   ,                  
+         "Location_2_Termite_Name"        = "location_termite_repeat_2_location_termite_repeat_termite_type_name"    ,                     
+         "Location_3_Termite_attacked"    =  "location_termite_repeat_3_location_termite_repeat_location_termite_name"  ,                   
+         "Location_3_Termite_Name"        = "location_termite_repeat_3_location_termite_repeat_termite_type_name" ,                        
+         "Location_4_Termite_attacked"    = "location_termite_repeat_4_location_termite_repeat_location_termite_name",                     
+         "Location_4_Termite_Name"        = "location_termite_repeat_4_location_termite_repeat_termite_type_name",                         
+         "Plot_1_name_'Second.weeding.Not.Same'"        ="plots_second_weeding_repeat_1_plots_second_weeding_repeat_plots_second_weeding_name"   ,      
+         "Plot_1_Second.weeding.Date"                   = "plots_second_weeding_repeat_1_plots_second_weeding_repeat_plot_second_weeding_date",          
+         "Plot_2_name_'Second.weeding.Not.Same'"        = "plots_second_weeding_repeat_2_plots_second_weeding_repeat_plots_second_weeding_name" ,        
+         "Plot_2_Second.weeding.Date"                   =  "plots_second_weeding_repeat_2_plots_second_weeding_repeat_plot_second_weeding_date" ,
+         Second_Weeding_Date = first_weeding_date_001)%>%
+  filter(
+    is.na(farmer_name) | farmer_name != clusters
+  ) %>%
+  
+  #------------------------------------------------
+# 2. Order alphabetically
+#------------------------------------------------
+arrange(
+  organization,clusters
+)
+##------------------------------------
+##DATASET 1: FARMER PROFILE
+##-------------------------------
+
+#
+Farmer_Profile <- Longrain_2025_master %>%
+  filter(farmer_profile=='yes')%>%
+  select(farmer_name,clusters,subcounty,organization,datacollector,Collection_Date,
+         gender,age_range,attended_workshop,contact,termite_problem,termite_type,
+         mound_proximity,distance,mound_termites,termite_causing_damage,termite_sample)
+
+##-------------------------------
+##DATASET 2: TRIAL SETUP
+##-----------------------------
+Trial_setup <- Longrain_2025_master %>%
+  filter(farmer_profile=='yes')%>%
+  select(farmer_name,clusters,subcounty,organization,datacollector,Collection_Date,
+         geolocation,termite_serverity,striga_info,trials,local_maize_planted,hybrid_maize_planted,
+         trial_plot_farmer_choice,plot_size_same,general_plot_size,
+         "Plot_1_Size"     ,     # = "plots_repeat_1_plots_repeat_plot_sizes"  ,                                                    
+         "Plot_2_name_'Size'" ,  # =  "plots_repeat_2_plots_repeat_plot_name" ,                                                      
+         "Plot_2_Size"  ,        # = "plots_repeat_2_plots_repeat_plot_sizes" ,                                                     
+         "Plot_3_name_'Size'" ,  # = "plots_repeat_3_plots_repeat_plot_name"  ,                                                     
+         "Plot_3_Size"  ,          #        = "plots_repeat_3_plots_repeat_plot_sizes" ,                                                     
+         "Plot_4_name_'Size'" ,     #       = "plots_repeat_4_plots_repeat_plot_name",                                                       
+         "Plot_4_Size"          ,   #      = "plots_repeat_4_plots_repeat_plot_sizes" ,
+         planting_date_same,actual_maize_planting_date, actual_covercrop_planting_date,
+         "Plot_1_name_'Crop.Planted'" ,   #    = "plot_planting_repeat_1_plot_planting_repeat_plot_planting_name" ,                             
+         "Plot_1_maize.Planted"      ,    #   = "plot_planting_repeat_1_plot_planting_repeat_date_maize_planted",                              
+         "Plot_1_CoverCrop.Planted"   ,   # = "plot_planting_repeat_1_plot_planting_repeat_date_cover_crop_planted",                         
+         "Plot_2_name_'Crop.Planted'",   #  = "plot_planting_repeat_2_plot_planting_repeat_plot_planting_name"  ,                            
+         "Plot_2_maize.Planted"    ,     #  = "plot_planting_repeat_2_plot_planting_repeat_date_maize_planted" ,                             
+         "Plot_2_CoverCrop.Planted"  ,   #  = "plot_planting_repeat_2_plot_planting_repeat_date_cover_crop_planted",                         
+         "Plot_3_name_'Crop.Planted'" ,   # = "plot_planting_repeat_3_plot_planting_repeat_plot_planting_name" ,                             
+         "Plot_3_maize.Planted"     ,    #  = "plot_planting_repeat_3_plot_planting_repeat_date_maize_planted" ,                             
+         "Plot_3_CoverCrop.Planted"  ,   #  = "plot_planting_repeat_3_plot_planting_repeat_date_cover_crop_planted" ,                        
+         "Plot_4_name_'Crop.Planted'" ,  #  = "plot_planting_repeat_4_plot_planting_repeat_plot_planting_name" ,                             
+         "Plot_4_maize.Planted"      ,   #  = "plot_planting_repeat_4_plot_planting_repeat_date_maize_planted" ,                             
+         "Plot_4_CoverCrop.Planted" ,    #  = "plot_planting_repeat_4_plot_planting_repeat_date_cover_crop_planted" ,
+         emmergence_same,week_2_emmergence_overall,
+         "Plot_1_name_'Emmergence'"   , #   = "emmergence_repeat_1_emmergence_repeat_emmergence_name" ,                                      
+         "Plot_1_Emmergence"       ,    #   = "emmergence_repeat_1_emmergence_repeat_emmergence"       ,                                     
+         "Plot_2_name_'Emmergence'"  ,  #   = "emmergence_repeat_2_emmergence_repeat_emmergence_name"   ,                                    
+         "Plot_2_Emmergence"       ,   #    = "emmergence_repeat_2_emmergence_repeat_emmergence"         ,                                   
+         "Plot_3_name_'Emmergence'" ,   #   = "emmergence_repeat_3_emmergence_repeat_emmergence_name"     ,                                  
+         "Plot_3_Emmergence"         ,  #   =  "emmergence_repeat_3_emmergence_repeat_emmergence"          ,                                  
+         "Plot_4_name_'Emmergence'"  ,  #   = "emmergence_repeat_4_emmergence_repeat_emmergence_name"       ,                                
+         "Plot_4_Emmergence"    )       #   = "emmergence_repeat_4_emmergence_repeat_emmergence" , )
+
+##------------------------------
+##DATASET 3: FIRST WEEDING
+##----------------------------
+  First_Weeding <- Longrain_2025_master %>%
+  filter(first_weed_data=='yes') %>%
+  select(farmer_name,clusters,subcounty,organization,datacollector,Collection_Date,
+         first_weeding_same,first_weeding_date,
+         "Plot_1_name_'first.weeding.Not.Same'"  ,      #= "plots_weeded_repeat_1_plots_weeded_repeat_plots_weeded_name",                                 
+         "Plot_1_First.weeding.Date",                    #= "plots_weeded_repeat_1_plots_weeded_repeat_plot_weeding_date" ,                                
+         "Plot_2_name_'first.weeding.Not.Same'",         #= "plots_weeded_repeat_2_plots_weeded_repeat_plots_weeded_name" ,                                
+         "Plot_2_First.weeding.Date"  ,                 #=  "plots_weeded_repeat_2_plots_weeded_repeat_plot_weeding_date",                                 
+         "Plot_3_name_'first.weeding.Not.Same'"  ,      #= "plots_weeded_repeat_3_plots_weeded_repeat_plots_weeded_name" ,                                
+         "Plot_3_First.weeding.Date" ,                  #= "plots_weeded_repeat_3_plots_weeded_repeat_plot_weeding_date",                                 
+         "Plot_4_name_'first.weeding.Not.Same'" ,       #= "plots_weeded_repeat_4_plots_weeded_repeat_plots_weeded_name" ,                                
+         "Plot_4_First.weeding.Date"  ,                 #= "plots_weeded_repeat_4_plots_weeded_repeat_plot_weeding_date" ,
+         reduction_after_first_weeding,
+         "Plot_1_name_'Attack.at.First.Weeding'"   ,              # = "first_weeding_repaet_1_first_weeding_repaet_first_weeding_name"  ,                            
+         "Plot_1_Population.Reduction.First.Weeding",             #= "first_weeding_repaet_1_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+         "Plot_2_name_'Attack.at.First.Weeding'"     ,            # = "first_weeding_repaet_2_first_weeding_repaet_first_weeding_name"   ,                           
+         "Plot_2_Population.Reduction.First.Weeding"  ,           ## = "first_weeding_repaet_2_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+         "Plot_3_name_'Attack.at.First.Weeding'"       ,          # = "first_weeding_repaet_3_first_weeding_repaet_first_weeding_name",            
+         "Plot_3_Population.Reduction.First.Weeding"    ,         # = "first_weeding_repaet_3_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+         "Plot_4_name_'Attack.at.First.Weeding'"         ,        # = "first_weeding_repaet_4_first_weeding_repaet_first_weeding_name"               ,               
+         "Plot_4_Population.Reduction.First.Weeding"      ,       #= "first_weeding_repaet_4_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+         signs_termite_attack,                                                                      
+         "Location_1_Termite_attacked",   # =  "location_termite_repeat_1_location_termite_repeat_location_termite_name"  ,                   
+         "Location_1_Termite_Name" ,      # = "location_termite_repeat_1_location_termite_repeat_termite_type_name"  ,                       
+         "Location_2_Termite_attacked",   # =   "location_termite_repeat_2_location_termite_repeat_location_termite_name"   ,                  
+         "Location_2_Termite_Name",       # = "location_termite_repeat_2_location_termite_repeat_termite_type_name"    ,                     
+         "Location_3_Termite_attacked",   # =  "location_termite_repeat_3_location_termite_repeat_location_termite_name"  ,                   
+         "Location_3_Termite_Name" ,      #= "location_termite_repeat_3_location_termite_repeat_termite_type_name" ,                        
+         "Location_4_Termite_attacked",   # = "location_termite_repeat_4_location_termite_repeat_location_termite_name",                     
+         "Location_4_Termite_Name"   ,    # = "location_termite_repeat_4_location_termite_repeat_termite_type_name",                           
+         "Plot_1_name_'Vigour'",  #= "vigour_repeat_1_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_1_Vigour" ,        # = "vigour_repeat_1_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_2_name_'Vigour'",  #= "vigour_repeat_2_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_2_Vigour" ,        #= "vigour_repeat_2_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_3_name_'Vigour'" , #= "vigour_repeat_3_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_3_Vigour"   ,      #= "vigour_repeat_3_vigour_repeat_plant_vigour_for_each_plot" ,                                   
+         "Plot_4_name_'Vigour'",  #= "vigour_repeat_4_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_4_Vigour"  ,      # = "vigour_repeat_4_vigour_repeat_plant_vigour_for_each_plot",
+         pests_diseases,moisture_stress,
+         moisture_stress_period)
+##---------------------------------------------
+##DATASET 4:SECOND WEEDING
+##-------------------------------------------
+Second_Weeding <- Longrain_2025_master %>%
+  filter(second_weeding_data=='yes')%>%
+  select(farmer_name,clusters,subcounty,organization,datacollector,Collection_Date,
+         second_weeding,second_weeding_same,Second_Weeding_Date,
+         "Plot_1_name_'Second.weeding.Not.Same'",       # ="plots_second_weeding_repeat_1_plots_second_weeding_repeat_plots_second_weeding_name"   ,      
+         "Plot_1_Second.weeding.Date"  ,                # = "plots_second_weeding_repeat_1_plots_second_weeding_repeat_plot_second_weeding_date",          
+         "Plot_2_name_'Second.weeding.Not.Same'",       # = "plots_second_weeding_repeat_2_plots_second_weeding_repeat_plots_second_weeding_name" ,        
+         "Plot_2_Second.weeding.Date"    ,              # =  "plots_second_weeding_repeat_2_plots_second_weeding_repeat_plot_second_weeding_date" ,
+         
+         reduction_after_second_weeding,
+         "Plot_1_name_'Attack.at.Second.Weeding'"   ,         #     =  "second_weeding_repeat_1_second_weeding_repeat_second_weeding_name" ,                          
+         "Plot_1_Population.Reduction.Second.Weeding",        #     =  "second_weeding_repeat_1_second_weeding_repeat_plot_reduced_pop_after_second_weeding" ,        
+         "Plot_2_name_'Attack.at.Second.Weeding'"    ,        #     =  "second_weeding_repeat_2_second_weeding_repeat_second_weeding_name",                           
+         "Plot_2_Population.Reduction.Second.Weeding",        #     =  "second_weeding_repeat_2_second_weeding_repeat_plot_reduced_pop_after_second_weeding" ,        
+         "Plot_3_name_'Attack.at.Second.Weeding'"    ,        #     =  "second_weeding_repeat_3_second_weeding_repeat_second_weeding_name"     ,                      
+         "Plot_3_Population.Reduction.Second.Weeding",        #     =  "second_weeding_repeat_3_second_weeding_repeat_plot_reduced_pop_after_second_weeding" ,        
+         "Plot_4_name_'Attack.at.Second.Weeding'" ,           #     =  "second_weeding_repeat_4_second_weeding_repeat_second_weeding_name"  ,                         
+         "Plot_4_Population.Reduction.Second.Weeding" ,       #     =  "second_weeding_repeat_4_second_weeding_repeat_plot_reduced_pop_after_second_weeding"   ,
+         signs_termite_attack,                                                                      
+         "Location_1_Termite_attacked",   # =  "location_termite_repeat_1_location_termite_repeat_location_termite_name"  ,                   
+         "Location_1_Termite_Name" ,      # = "location_termite_repeat_1_location_termite_repeat_termite_type_name"  ,                       
+         "Location_2_Termite_attacked",   # =   "location_termite_repeat_2_location_termite_repeat_location_termite_name"   ,                  
+         "Location_2_Termite_Name",       # = "location_termite_repeat_2_location_termite_repeat_termite_type_name"    ,                     
+         "Location_3_Termite_attacked",   # =  "location_termite_repeat_3_location_termite_repeat_location_termite_name"  ,                   
+         "Location_3_Termite_Name" ,      #= "location_termite_repeat_3_location_termite_repeat_termite_type_name" ,                        
+         "Location_4_Termite_attacked",   # = "location_termite_repeat_4_location_termite_repeat_location_termite_name",                     
+         "Location_4_Termite_Name"   ,    # = "location_termite_repeat_4_location_termite_repeat_termite_type_name",                           
+         "Plot_1_name_'Vigour'",  #= "vigour_repeat_1_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_1_Vigour" ,        # = "vigour_repeat_1_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_2_name_'Vigour'",  #= "vigour_repeat_2_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_2_Vigour" ,        #= "vigour_repeat_2_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_3_name_'Vigour'" , #= "vigour_repeat_3_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_3_Vigour"   ,      #= "vigour_repeat_3_vigour_repeat_plant_vigour_for_each_plot" ,                                   
+         "Plot_4_name_'Vigour'",  #= "vigour_repeat_4_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_4_Vigour"  ,       # = "vigour_repeat_4_vigour_repeat_plant_vigour_for_each_plot",
+         pests_diseases,moisture_stress,
+         moisture_stress_period
+         )
+##-------------------------------------------
+## DATASET 5: TASSELING STAGE
+#---------------------------------------
+ Tasseling_Stage <- Longrain_2025_master %>%
+  filter(tasseling_data=='yes')%>%
+  select(farmer_name,clusters,subcounty,organization,datacollector,Collection_Date,
+         #plot_reduced_pop_at_tasseling,
+         "Plot_1_name_'Attack.at.Tasseling'"     ,      #   =  "tasseling_repeat_1_tasseling_repeat_tasseling_pop_name" ,                                     
+         "Plot_1_Population.Reduction.Tasseling"  ,     #   =  "tasseling_repeat_1_tasseling_repeat_pop_reduction_at_tasseling" ,                             
+         "Plot_2_name_'Attack.at.Tasseling'"    ,       #   =  "tasseling_repeat_2_tasseling_repeat_tasseling_pop_name"     ,                                 
+         "Plot_2_Population.Reduction.Tasseling"   ,    #   =  "tasseling_repeat_2_tasseling_repeat_pop_reduction_at_tasseling" ,                             
+         "Plot_3_name_'Attack.at.Tasseling'"       ,    #   =  "tasseling_repeat_3_tasseling_repeat_tasseling_pop_name"   ,                                   
+         "Plot_3_Population.Reduction.Tasseling"  ,     #   =  "tasseling_repeat_3_tasseling_repeat_pop_reduction_at_tasseling" ,                             
+         "Plot_4_name_'Attack.at.Tasseling'"     ,      #   =  "tasseling_repeat_4_tasseling_repeat_tasseling_pop_name" ,                                     
+         "Plot_4_Population.Reduction.Tasseling"  ,     #   =  "tasseling_repeat_4_tasseling_repeat_pop_reduction_at_tasseling",
+         signs_termite_attack,                                                                      
+         "Location_1_Termite_attacked",   # =  "location_termite_repeat_1_location_termite_repeat_location_termite_name"  ,                   
+         "Location_1_Termite_Name" ,      # = "location_termite_repeat_1_location_termite_repeat_termite_type_name"  ,                       
+         "Location_2_Termite_attacked",   # =   "location_termite_repeat_2_location_termite_repeat_location_termite_name"   ,                  
+         "Location_2_Termite_Name",       # = "location_termite_repeat_2_location_termite_repeat_termite_type_name"    ,                     
+         "Location_3_Termite_attacked",   # =  "location_termite_repeat_3_location_termite_repeat_location_termite_name"  ,                   
+         "Location_3_Termite_Name" ,      #= "location_termite_repeat_3_location_termite_repeat_termite_type_name" ,                        
+         "Location_4_Termite_attacked",   # = "location_termite_repeat_4_location_termite_repeat_location_termite_name",                     
+         "Location_4_Termite_Name"   ,    # = "location_termite_repeat_4_location_termite_repeat_termite_type_name",                           
+         "Plot_1_name_'Vigour'",  #= "vigour_repeat_1_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_1_Vigour" ,        # = "vigour_repeat_1_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_2_name_'Vigour'",  #= "vigour_repeat_2_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_2_Vigour" ,        #= "vigour_repeat_2_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_3_name_'Vigour'" , #= "vigour_repeat_3_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_3_Vigour"   ,      #= "vigour_repeat_3_vigour_repeat_plant_vigour_for_each_plot" ,                                   
+         "Plot_4_name_'Vigour'",  #= "vigour_repeat_4_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_4_Vigour"  ,      # = "vigour_repeat_4_vigour_repeat_plant_vigour_for_each_plot",
+         pests_diseases,moisture_stress,
+         moisture_stress_period)
+##---------------------------------------------
+##DATASET 6: HARVESTING STAGE
+##--------------------------------------------
+Harvesting_Stage <- Longrain_2025_master%>%
+  filter(data_harvest=='yes')%>%
+  select(farmer_name,clusters,subcounty,organization,datacollector,Collection_Date,
+         plant_loss_at_harvest,#plot_reduced_pop_at_harvest,
+         "Plot_1_name_'Attack.at.Harvesting'"        ,  #   = "loss_harvest_repeat_1_loss_harvest_repeat_loss_harvest_name" ,                                
+         "Plot_1_Population.Reduction.Harvesting"    ,  #   = "loss_harvest_repeat_1_loss_harvest_repeat_pop_harvesting"  ,                                  
+         "Plot_2_name_'Attack.at.Harvesting'"       ,   #   = "loss_harvest_repeat_2_loss_harvest_repeat_loss_harvest_name",                                 
+         "Plot_2_Population.Reduction.Harvesting"   ,   #   = "loss_harvest_repeat_2_loss_harvest_repeat_pop_harvesting",                                    
+         "Plot_3_name_'Attack.at.Harvesting'"      ,    #  = "loss_harvest_repeat_3_loss_harvest_repeat_loss_harvest_name",                                 
+         "Plot_3_Population.Reduction.Harvesting"  ,    #  = "loss_harvest_repeat_3_loss_harvest_repeat_pop_harvesting",
+         signs_termite_attack,                                                                      
+         "Location_1_Termite_attacked",   # =  "location_termite_repeat_1_location_termite_repeat_location_termite_name"  ,                   
+         "Location_1_Termite_Name" ,      # = "location_termite_repeat_1_location_termite_repeat_termite_type_name"  ,                       
+         "Location_2_Termite_attacked",   # =   "location_termite_repeat_2_location_termite_repeat_location_termite_name"   ,                  
+         "Location_2_Termite_Name",       # = "location_termite_repeat_2_location_termite_repeat_termite_type_name"    ,                     
+         "Location_3_Termite_attacked",   # =  "location_termite_repeat_3_location_termite_repeat_location_termite_name"  ,                   
+         "Location_3_Termite_Name" ,      #= "location_termite_repeat_3_location_termite_repeat_termite_type_name" ,                        
+         "Location_4_Termite_attacked",   # = "location_termite_repeat_4_location_termite_repeat_location_termite_name",                     
+         "Location_4_Termite_Name"   ,    # = "location_termite_repeat_4_location_termite_repeat_termite_type_name",                           
+         "Plot_1_name_'Vigour'",  #= "vigour_repeat_1_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_1_Vigour" ,        # = "vigour_repeat_1_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_2_name_'Vigour'",  #= "vigour_repeat_2_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_2_Vigour" ,        #= "vigour_repeat_2_vigour_repeat_plant_vigour_for_each_plot",                                    
+         "Plot_3_name_'Vigour'" , #= "vigour_repeat_3_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_3_Vigour"   ,      #= "vigour_repeat_3_vigour_repeat_plant_vigour_for_each_plot" ,                                   
+         "Plot_4_name_'Vigour'",  #= "vigour_repeat_4_vigour_repeat_plant_vigour_name" ,                                            
+         "Plot_4_Vigour"  ,      # = "vigour_repeat_4_vigour_repeat_plant_vigour_for_each_plot",
+         pests_diseases,moisture_stress,
+         moisture_stress_period,stage_most_plants_lost, supplementary_fertilizer_used,                                                               
+         biopesticide_use,where_biopesticide_applied,prcatice_ca)
+
+## -----------------------
+## COMBINED SHORTGRAIN DATA
+## -----------------------
+Shortrain_2025_master <- bind_rows(
+  ShortRain_2025        %>% mutate(source = "ShortRain_2025"),
+  SOFDI_shortrain       %>% mutate(source = "SOFDI_shortrain")
+)
+##-----------------------------------
+# Create a new workbook for Longrains
+##-----------------------------------
+wb1 <- createWorkbook()
+
+# Add sheets
+addWorksheet(wb1, "Farmer_Profile")
+addWorksheet(wb1, "Trial_setup")
+addWorksheet(wb1, "First_Weeding")
+addWorksheet(wb1, "Second_Weeding")
+addWorksheet(wb1, "Tasseling_Stage")
+addWorksheet(wb1, "Harvesting_Stage")
+
+
+# Write data to sheets
+writeData(wb1, sheet = "Farmer_Profile", Farmer_Profile)
+writeData(wb1, sheet = "Trial_setup", Trial_setup)
+writeData(wb1, sheet = "First_Weeding", First_Weeding)
+writeData(wb1, sheet = "Second_Weeding", Second_Weeding)
+writeData(wb1, sheet = "Tasseling_Stage", Tasseling_Stage)
+writeData(wb1, sheet = "Harvesting_Stage", Harvesting_Stage)
+
+
+# Save workbook
+saveWorkbook(wb1, "Longrains_Termite_FRN_Data_2025.xlsx", overwrite = TRUE)
+
