@@ -1,0 +1,1224 @@
+########################################################
+# Clean Kobo Farmer Data and Reshape Repeat Groups
+# Author: Michael Chariga (integrated, fixed)
+# Date: September 2025
+########################################################
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+
+# --- STEP 0: Start from Kobo dataframe ---
+df <- termite_data   # raw Kobo dataframe
+
+# --- STEP 1: Normalize text identifiers ---
+df <- df %>%
+  mutate(
+    farmer_name   = str_squish(str_trim(str_to_title(farmer_name))),
+    clusters      = str_squish(str_trim(str_to_title(clusters))),
+    organization  = str_squish(str_trim(str_to_title(organization))),
+    subcounty     = str_squish(str_trim(str_to_title(subcounty)))
+  ) %>%
+  mutate(farmer_id = paste(clusters, farmer_name, sep = "_"))
+
+# --- STEP 2: Merge helper columns into main ---
+merge_helper <- function(main, helper) {
+  if (helper %in% names(df)) {
+    df[[main]] <<- ifelse(!is.na(df[[helper]]) & df[[helper]] != "",
+                          df[[helper]], df[[main]])
+    df <<- df %>% select(-any_of(helper))
+  }
+}
+
+merge_helper("datacollector", "other_datacollector_name")
+merge_helper("termite_type", "other_termite_type")
+merge_helper("mound_termites", "other_mound_termite")
+merge_helper("signs_termite_attack", "other_sign_termite_attack")
+merge_helper("location_termite_attack", "other_location_termite_attack")
+merge_helper("compost_used", "other_compost_use")
+
+# --- STEP 3: Ensure farmer_profile exists ---
+if(!"farmer_profile" %in% names(df)) {
+  df$farmer_profile <- NA_character_
+}
+
+# --- STEP 4: Assign round numbers ---
+df <- df %>%
+  mutate(
+    # Clean the relevant columns
+    second_weeding_data = str_trim(tolower(second_weeding_data)),
+    tasseling_data     = str_trim(tolower(tasseling_data)),
+    data_harvest       = str_trim(tolower(data_harvest)),
+    
+    # Assign round_number
+    round_number = case_when(
+      second_weeding_data == "yes"  ~ "r2",
+      tasseling_data == "yes"       ~ "r3",
+      data_harvest == "yes"         ~ "r4",
+      second_weeding_data == "no" &
+        tasseling_data == "no" &
+        data_harvest == "no"          ~ "r1",
+      TRUE                           ~ NA_character_
+    )
+  )
+
+# --- STEP 5: Drop metadata/attachments ---
+drop_cols <- c(
+  "meta_instance_id","meta_root_uuid","meta_deprecated_id","formhub_uuid",
+  "version","xform_id_string","uuid","status","submission_time","tags",
+  "notes","submitted_by","kobo_version_id",
+  "id","starttime","endtime","validation_status_timestamp","validation_status_uid"                                                                       
+ ,"validation_status_by_whom","validation_status_label"
+)
+drop_cols <- c(drop_cols, grep("^attachments_", names(df), value = TRUE))
+df <- df %>% select(-any_of(drop_cols))
+
+
+# --- STEP 6: Clean emergence repeat group ---
+valid_emergence_cols <- c(
+  "lablab_plot", "hybrid_plot", "local_maize_plot", "farmer_choice_plot",
+  "lablab_plot_next_hybrid", "lablab_plot_next_local",
+  "hybrid_maize", "local_maize",
+  "lablab_plot_next_hybrid_maize", "lablab_plot_next_local_maize",
+  "hybrid_maize_variety_plot", "local_maize_variety_plot",
+  "hybrid_ombosh", "local_ombosh", "farmer_choice_vs_ombosh",
+  "hybrid_ombosh_plot", "local_ombosh_plot", "farmer_choice_vs_ombosh_Plot"
+)
+
+emergence_wide <- NULL
+if (any(grepl("^emmergence_repeat", names(df)))) {
+  df <- df %>% mutate(.row_for_em = row_number())
+  
+  em_cols <- names(df)[grepl("^emmergence_repeat_\\d+_emmergence_repeat_emmergence", names(df))]
+  
+  em_long <- df %>%
+    select(.row_for_em, all_of(em_cols)) %>%
+    pivot_longer(
+      cols = - .row_for_em,
+      names_to = c("repeat_num", "suffix"),
+      names_pattern = "^emmergence_repeat_(\\d+)_emmergence_repeat_emmergence(?:_(.*))?$",
+      values_to = "val"
+    ) %>%
+    mutate(suffix = ifelse(is.na(suffix) | suffix == "", "emmergence", suffix)) %>%
+    pivot_wider(
+      id_cols = c(.row_for_em, repeat_num),
+      names_from = suffix,
+      values_from = val,
+      values_fn = list(val = ~ first(na.omit(.)))
+    )
+  
+  em_long <- em_long %>%
+    filter(!is.na(name) & name != "" & !is.na(emmergence) & emmergence != "")
+  
+  em_long <- em_long %>%
+    mutate(name_clean = make.names(tolower(str_trim(name)), unique = TRUE)) %>%
+    filter(name_clean %in% tolower(valid_emergence_cols)) %>%
+    mutate(name_clean = case_when(
+      name_clean %in% make.names(tolower(valid_emergence_cols)) ~ valid_emergence_cols[match(name_clean, make.names(tolower(valid_emergence_cols)))],
+      TRUE ~ name_clean
+    ))
+  
+  if (nrow(em_long) > 0) {
+    em_w <- em_long %>%
+      group_by(.row_for_em, name_clean) %>%
+      summarise(emmergence = first(emmergence), .groups = "drop") %>%
+      mutate(colname = paste0(name_clean, "_week_2_emmergence")) %>%
+      pivot_wider(
+        id_cols = .row_for_em,
+        names_from = colname,
+        values_from = emmergence,
+        values_fn = list(emmergence = ~ first(na.omit(.)))
+      )
+    
+    emergence_wide <- em_w
+    df <- df %>%
+      left_join(emergence_wide, by = ".row_for_em") %>%
+      select(-.row_for_em)
+  } else {
+    df <- df %>% select(-.row_for_em)
+  }
+}
+################################3
+################################
+
+# --- STEP 6b: Clean vigour repeat group ---
+valid_vigour_cols <- c(
+  "lablab_plot", "hybrid_plot", "local_maize_plot", "farmer_choice_plot",
+  "lablab_plot_next_hybrid", "lablab_plot_next_local",
+  "hybrid_maize", "local_maize",
+  "lablab_plot_next_hybrid_maize", "lablab_plot_next_local_maize",
+  "hybrid_maize_variety_plot", "local_maize_variety_plot",
+  "hybrid_ombosh", "local_ombosh", "farmer_choice_vs_ombosh",
+  "hybrid_ombosh_plot", "local_ombosh_plot", "farmer_choice_vs_ombosh_Plot"
+)
+
+vigour_wide <- NULL
+if (any(grepl("^vigour_repeat", names(df)))) {
+  df <- df %>% mutate(.row_for_vi = row_number())
+  
+  vi_cols <- names(df)[grepl("^vigour_repeat_\\d+_", names(df))]
+  
+  vi_long <- df %>%
+    select(.row_for_vi, all_of(vi_cols)) %>%
+    pivot_longer(
+      cols = - .row_for_vi,
+      names_to = c("repeat_num", "field"),
+      names_pattern = "^vigour_repeat_(\\d+)_vigour_repeat_plant_vigour_(.*)$",
+      values_to = "val"
+    ) %>%
+    pivot_wider(
+      id_cols = c(.row_for_vi, repeat_num),
+      names_from = field,
+      values_from = val
+    )
+  
+  # clean names and filter
+  vi_long <- vi_long %>%
+    filter(!is.na(name) & name != "" & !is.na(for_each_plot) & for_each_plot != "") %>%
+    mutate(name_clean = make.names(tolower(str_trim(name)), unique = TRUE)) %>%
+    filter(name_clean %in% tolower(valid_vigour_cols)) %>%
+    mutate(name_clean = case_when(
+      name_clean %in% make.names(tolower(valid_vigour_cols)) ~ valid_vigour_cols[match(name_clean, make.names(tolower(valid_vigour_cols)))],
+      TRUE ~ name_clean
+    ))
+  
+  if (nrow(vi_long) > 0) {
+    vi_w <- vi_long %>%
+      group_by(.row_for_vi, name_clean) %>%
+      summarise(vigour = first(for_each_plot), .groups = "drop") %>%
+      mutate(colname = paste0(name_clean, "_Plant_Vigour")) %>%
+      pivot_wider(
+        id_cols = .row_for_vi,
+        names_from = colname,
+        values_from = vigour,
+        values_fn = list(vigour = ~ first(na.omit(.)))
+      )
+    
+    vigour_wide <- vi_w
+    df <- df %>%
+      left_join(vigour_wide, by = ".row_for_vi") %>%
+      select(-.row_for_vi)
+  } else {
+    df <- df %>% select(-.row_for_vi)
+  }
+}
+
+#############################################
+##############################################
+# --- STEP 6c: Clean tasseling repeat group ---
+tasseling_cols <- c(
+  "lablab_plot", "hybrid_plot", "local_maize_plot", "farmer_choice_plot",
+  "lablab_plot_next_hybrid", "lablab_plot_next_local",
+  "hybrid_maize", "local_maize",
+  "lablab_plot_next_hybrid_maize", "lablab_plot_next_local_maize",
+  "hybrid_maize_variety_plot", "local_maize_variety_plot",
+  "hybrid_ombosh", "local_ombosh", "farmer_choice_vs_ombosh",
+  "hybrid_ombosh_plot", "local_ombosh_plot", "farmer_choice_vs_ombosh_Plot"
+)
+
+tasseling_wide <- NULL
+if (any(grepl("^tasseling_repeat", names(df)))) {
+  df <- df %>% mutate(.row_for_ta = row_number())
+  
+  ta_cols <- names(df)[grepl("^tasseling_repeat_\\d+_", names(df))]
+  
+  ta_long <- df %>%
+    select(.row_for_ta, all_of(ta_cols)) %>%
+    pivot_longer(
+      cols = - .row_for_ta,
+      names_to = c("repeat_num", "field"),
+      names_pattern = "^tasseling_repeat_(\\d+)_tasseling_repeat_(?:tasseling_pop_)?(.*)$",
+      values_to = "val"
+    ) %>%
+    pivot_wider(
+      id_cols = c(.row_for_ta, repeat_num),
+      names_from = field,
+      values_from = val
+    )
+  
+  # clean names and filter
+  ta_long <- ta_long %>%
+    filter(!is.na(name) & name != "" &
+             !is.na(pop_reduction_at_tasseling) & pop_reduction_at_tasseling != "") %>%
+    mutate(name_clean = make.names(tolower(str_trim(name)), unique = TRUE)) %>%
+    filter(name_clean %in% tolower(tasseling_cols)) %>%
+    mutate(name_clean = case_when(
+      name_clean %in% make.names(tolower(tasseling_cols)) ~ tasseling_cols[match(name_clean, make.names(tolower(tasseling_cols)))],
+      TRUE ~ name_clean
+    ))
+  
+  if (nrow(ta_long) > 0) {
+    ta_w <- ta_long %>%
+      group_by(.row_for_ta, name_clean) %>%
+      summarise(tasseling = first(pop_reduction_at_tasseling), .groups = "drop") %>%
+      mutate(colname = paste0(name_clean, "_tasseling_pop_reduction")) %>%
+      pivot_wider(
+        id_cols = .row_for_ta,
+        names_from = colname,
+        values_from = tasseling,
+        values_fn = list(tasseling = ~ first(na.omit(.)))
+      )
+    
+    df <- df %>%
+      left_join(ta_w, by = ".row_for_ta") %>%
+      select(-.row_for_ta)
+  } else {
+    df <- df %>% select(-.row_for_ta)
+  }
+}
+# --- STEP 6c: Clean harvest repeat group ---
+harvest_cols <- c(
+  "lablab_plot", "hybrid_plot", "local_maize_plot", "farmer_choice_plot",
+  "lablab_plot_next_hybrid", "lablab_plot_next_local",
+  "hybrid_maize", "local_maize",
+  "lablab_plot_next_hybrid_maize", "lablab_plot_next_local_maize",
+  "hybrid_maize_variety_plot", "local_maize_variety_plot",
+  "hybrid_ombosh", "local_ombosh", "farmer_choice_vs_ombosh",
+  "hybrid_ombosh_plot", "local_ombosh_plot", "farmer_choice_vs_ombosh_Plot"
+)
+
+harvest_wide <- NULL
+if (any(grepl("^loss_harvest_repeat", names(df)))) {
+  df <- df %>% mutate(.row_for_ha = row_number())
+  
+  ha_cols <- names(df)[grepl("^loss_harvest_repeat_\\d+_", names(df))]
+  
+  ha_long <- df %>%
+    select(.row_for_ha, all_of(ha_cols)) %>%
+    pivot_longer(
+      cols = - .row_for_ha,
+      names_to = c("repeat_num", "field"),
+      names_pattern = "^loss_harvest_repeat_(\\d+)_loss_harvest_repeat_(.*)$",
+      values_to = "val"
+    ) %>%
+    pivot_wider(
+      id_cols = c(.row_for_ha, repeat_num),
+      names_from = field,
+      values_from = val
+    )
+  
+  # clean names and filter
+  ha_long <- ha_long %>%
+    filter(!is.na(loss_harvest_name) & loss_harvest_name != "" &
+             !is.na(pop_harvesting) & pop_harvesting != "") %>%
+    mutate(name_clean = make.names(tolower(str_trim(loss_harvest_name)), unique = TRUE)) %>%
+    filter(name_clean %in% tolower(harvest_cols)) %>%
+    mutate(name_clean = case_when(
+      name_clean %in% make.names(tolower(harvest_cols)) ~ harvest_cols[match(name_clean, make.names(tolower(harvest_cols)))],
+      TRUE ~ name_clean
+    ))
+  
+  ha_w <- ha_long %>%
+    group_by(.row_for_ha, name_clean) %>%
+    summarise(harvest = first(pop_harvesting), .groups = "drop") %>%
+    mutate(colname = paste0(name_clean, "_pop_harvesting")) %>%
+    pivot_wider(
+      id_cols = .row_for_ha,
+      names_from = colname,
+      values_from = harvest,
+      values_fn = list(harvest = ~ first(na.omit(.)))
+    )
+    
+    df <- df %>%
+      left_join(ha_w, by = ".row_for_ha") %>%
+      select(-.row_for_ha)
+  } else {
+    df <- df %>% select(-.row_for_ha)
+  }
+#################################
+####################################
+# --- STEP 6d: Clean plot size repeat group ---
+plot_size_cols <- c(
+  "lablab_plot", "hybrid_plot", "local_maize_plot", "farmer_choice_plot",
+  "lablab_plot_next_hybrid", "lablab_plot_next_local",
+  "hybrid_maize", "local_maize",
+  "lablab_plot_next_hybrid_maize", "lablab_plot_next_local_maize",
+  "hybrid_maize_variety_plot", "local_maize_variety_plot",
+  "hybrid_ombosh", "local_ombosh", "farmer_choice_vs_ombosh",
+  "hybrid_ombosh_plot", "local_ombosh_plot", "farmer_choice_vs_ombosh_Plot"
+)
+
+plot_size_wide <- NULL
+if (any(grepl("^plots_repeat", names(df)))) {
+  df <- df %>% mutate(.row_for_ps = row_number())
+  
+  ps_cols <- names(df)[grepl("^plots_repeat_\\d+_", names(df))]
+  
+  ps_long <- df %>%
+    select(.row_for_ps, all_of(ps_cols)) %>%
+    pivot_longer(
+      cols = - .row_for_ps,
+      names_to = c("repeat_num", "field"),
+      names_pattern = "^plots_repeat_(\\d+)_plots_repeat_(.*)$",
+      values_to = "val"
+    ) %>%
+    pivot_wider(
+      id_cols = c(.row_for_ps, repeat_num),
+      names_from = field,
+      values_from = val
+    )
+  
+  # clean names and filter
+  ps_long <- ps_long %>%
+    filter(!is.na(plot_name) & plot_name != "" &
+             !is.na(plot_sizes) & plot_sizes != "") %>%
+    mutate(name_clean = make.names(tolower(str_trim(plot_name)), unique = TRUE)) %>%
+    filter(name_clean %in% tolower(plot_size_cols)) %>%
+    mutate(name_clean = case_when(
+      name_clean %in% make.names(tolower(plot_size_cols)) ~ plot_size_cols[match(name_clean, make.names(tolower(plot_size_cols)))],
+      TRUE ~ name_clean
+    ))
+  
+  ps_w <- ps_long %>%
+    group_by(.row_for_ps, name_clean) %>%
+    summarise(plots = first(plot_sizes), .groups = "drop") %>%
+    mutate(colname = paste0(name_clean, "_size")) %>%
+    pivot_wider(
+      id_cols = .row_for_ps,
+      names_from = colname,
+      values_from = plots,
+      values_fn = list(plots = ~ first(na.omit(.)))
+    )
+  
+  df <- df %>%
+    left_join(ps_w, by = ".row_for_ps") %>%
+    select(-.row_for_ps)
+} else {
+  df <- df %>% select(-.row_for_ps)
+}
+
+#################
+##############################################
+# --- STEP 6d: Clean plot weeding repeat group ---
+plots_weeded_cols <- c(
+  "lablab_plot", "hybrid_plot", "local_maize_plot", "farmer_choice_plot",
+  "lablab_plot_next_hybrid", "lablab_plot_next_local",
+  "hybrid_maize", "local_maize",
+  "lablab_plot_next_hybrid_maize", "lablab_plot_next_local_maize",
+  "hybrid_maize_variety_plot", "local_maize_variety_plot",
+  "hybrid_ombosh", "local_ombosh", "farmer_choice_vs_ombosh",
+  "hybrid_ombosh_plot", "local_ombosh_plot", "farmer_choice_vs_ombosh_Plot"
+)
+
+plot_weeded_wide <- NULL
+if (any(grepl("^plots_weeded_repeat", names(df)))) {
+  df <- df %>% mutate(.row_for_pw = row_number())
+  
+  pw_cols <- names(df)[grepl("^plots_weeded_repeat_\\d+_", names(df))]
+  
+  pw_long <- df %>%
+    select(.row_for_pw, all_of(pw_cols)) %>%
+    pivot_longer(
+      cols = - .row_for_pw,
+      names_to = c("repeat_num", "field"),
+      names_pattern = "^plots_weeded_repeat_(\\d+)_plots_weeded_repeat_(.*)$",
+      values_to = "val"
+    ) %>%
+    pivot_wider(
+      id_cols = c(.row_for_pw, repeat_num),
+      names_from = field,
+      values_from = val
+    )
+  
+  # clean names and filter
+  pw_long <- pw_long %>%
+    rename(
+      weeded_name = any_of("plots_weeded_name"),
+      weeding_date = any_of("plot_weeding_date")
+    ) %>%
+    filter(!is.na(weeded_name) & weeded_name != "" &
+             !is.na(weeding_date) & weeding_date != "") %>%
+    mutate(name_clean = make.names(tolower(str_trim(weeded_name)), unique = TRUE)) %>%
+    filter(name_clean %in% tolower(plots_weeded_cols)) %>%
+    mutate(name_clean = case_when(
+      name_clean %in% make.names(tolower(plots_weeded_cols)) ~ 
+        plots_weeded_cols[match(name_clean, make.names(tolower(plots_weeded_cols)))],
+      TRUE ~ name_clean
+    ))
+  
+  
+  pw_w <- pw_long %>%
+    group_by(.row_for_pw, name_clean) %>%
+    summarise(plots = first(weeding_date), .groups = "drop") %>%
+    mutate(colname = paste0(name_clean, "_weeding_date")) %>%
+    pivot_wider(
+      id_cols = .row_for_pw,
+      names_from = colname,
+      values_from = plots,
+      values_fn = list(plots = ~ first(na.omit(.)))
+    )
+  
+  df <- df %>%
+    left_join(pw_w, by = ".row_for_pw") %>%
+    select(-.row_for_pw)
+} else {
+  df <- df %>% select(-.row_for_pw)
+}
+
+#################
+##############################################
+# --- STEP 6f: Clean plot second weeding Population reduction repeat group ---
+Second_weeding_pop_reduction_cols <- c(
+  "lablab_plot", "hybrid_plot", "local_maize_plot", "farmer_choice_plot",
+  "lablab_plot_next_hybrid", "lablab_plot_next_local",
+  "hybrid_maize", "local_maize",
+  "lablab_plot_next_hybrid_maize", "lablab_plot_next_local_maize",
+  "hybrid_maize_variety_plot", "local_maize_variety_plot",
+  "hybrid_ombosh", "local_ombosh", "farmer_choice_vs_ombosh",
+  "hybrid_ombosh_plot", "local_ombosh_plot", "farmer_choice_vs_ombosh_Plot"
+)
+
+pop_second_weeding_wide <- NULL
+if (any(grepl("^second_weeding_repeat", names(df)))) {
+  df <- df %>% mutate(.row_for_psw = row_number())
+  
+  psw_cols <- names(df)[grepl("^second_weeding_repeat_\\d+_", names(df))]
+  
+  psw_long <- df %>%
+    select(.row_for_psw, all_of(psw_cols)) %>%
+    pivot_longer(
+      cols = - .row_for_psw,
+      names_to = c("repeat_num", "field"),
+      names_pattern = "^second_weeding_repeat_(\\d+)_second_weeding_repeat_(.*)$",
+      values_to = "val"
+    ) %>%
+    pivot_wider(
+      id_cols = c(.row_for_psw, repeat_num),
+      names_from = field,
+      values_from = val
+    )
+  
+  # clean names and filter
+  psw_long <- psw_long %>%
+    filter(!is.na(second_weeding_name) & second_weeding_name != "" &
+             !is.na(plot_reduced_pop_after_second_weeding) & plot_reduced_pop_after_second_weeding != "") %>%
+    mutate(name_clean = make.names(tolower(str_trim(second_weeding_name)), unique = TRUE)) %>%
+    filter(name_clean %in% tolower(Second_weeding_pop_reduction_cols)) %>%
+    mutate(name_clean = case_when(
+      name_clean %in% make.names(tolower(Second_weeding_pop_reduction_cols)) ~ Second_weeding_pop_reduction_cols[match(name_clean, make.names(tolower(Second_weeding_pop_reduction_cols)))],
+      TRUE ~ name_clean
+    ))
+  
+  psw_w <- psw_long %>%
+    group_by(.row_for_psw, name_clean) %>%
+    summarise(plots = first(plot_reduced_pop_after_second_weeding), .groups = "drop") %>%
+    mutate(colname = paste0(name_clean, "_second_weeding_pop_reduction")) %>%
+    pivot_wider(
+      id_cols = .row_for_psw,
+      names_from = colname,
+      values_from = plots,
+      values_fn = list(plots = ~ first(na.omit(.)))
+    )
+  
+  df <- df %>%
+    left_join(psw_w, by = ".row_for_psw") %>%
+    select(-.row_for_psw)
+} else {
+  df <- df %>% select(-.row_for_psw)
+}
+#################
+##############################################
+# --- STEP 6e: Clean plot first weeding Population reduction repeat group ---
+First_weeding_pop_reduction_cols <- c(
+  "lablab_plot", "hybrid_plot", "local_maize_plot", "farmer_choice_plot",
+  "lablab_plot_next_hybrid", "lablab_plot_next_local",
+  "hybrid_maize", "local_maize",
+  "lablab_plot_next_hybrid_maize", "lablab_plot_next_local_maize",
+  "hybrid_maize_variety_plot", "local_maize_variety_plot",
+  "hybrid_ombosh", "local_ombosh", "farmer_choice_vs_ombosh",
+  "hybrid_ombosh_plot", "local_ombosh_plot", "farmer_choice_vs_ombosh_Plot"
+)
+
+pop_first_weeding_wide <- NULL
+if (any(grepl("^first_weeding_repaet", names(df)))) {
+  df <- df %>% mutate(.row_for_pfw = row_number())
+  
+  pfw_cols <- names(df)[grepl("^first_weeding_repaet_\\d+_", names(df))]
+  
+  pfw_long <- df %>%
+    select(.row_for_pfw, all_of(pfw_cols)) %>%
+    pivot_longer(
+      cols = - .row_for_pfw,
+      names_to = c("repeat_num", "field"),
+      names_pattern = "^first_weeding_repaet_(\\d+)_first_weeding_repaet_(.*)$",
+      values_to = "val"
+    ) %>%
+    pivot_wider(
+      id_cols = c(.row_for_pfw, repeat_num),
+      names_from = field,
+      values_from = val
+    )
+  
+  # clean names and filter
+  pfw_long <- pfw_long %>%
+    filter(!is.na(first_weeding_name) & first_weeding_name != "" &
+             !is.na(reduction_in_plot_population_after_first_weeding) & reduction_in_plot_population_after_first_weeding != "") %>%
+    mutate(name_clean = make.names(tolower(str_trim(first_weeding_name)), unique = TRUE)) %>%
+    filter(name_clean %in% tolower(First_weeding_pop_reduction_cols)) %>%
+    mutate(name_clean = case_when(
+      name_clean %in% make.names(tolower(First_weeding_pop_reduction_cols)) ~ First_weeding_pop_reduction_cols[match(name_clean, make.names(tolower(First_weeding_pop_reduction_cols)))],
+      TRUE ~ name_clean
+    ))
+  
+  pfw_w <- pfw_long %>%
+    group_by(.row_for_pfw, name_clean) %>%
+    summarise(plots = first(reduction_in_plot_population_after_first_weeding), .groups = "drop") %>%
+    mutate(colname = paste0(name_clean, "_First_weeding_pop_reduction")) %>%
+    pivot_wider(
+      id_cols = .row_for_pfw,
+      names_from = colname,
+      values_from = plots,
+      values_fn = list(plots = ~ first(na.omit(.)))
+    )
+  
+  df <- df %>%
+    left_join(pfw_w, by = ".row_for_pfw") %>%
+    select(-.row_for_pfw)
+} else {
+  df <- df %>% select(-.row_for_pfw)
+}
+#################
+##############################################
+# --- STEP 6f: Clean plot planting repeat group ---
+plot_planting_cols <- c(
+  "lablab_plot", "hybrid_plot", "local_maize_plot", "farmer_choice_plot",
+  "lablab_plot_next_hybrid", "lablab_plot_next_local",
+  "hybrid_maize", "local_maize",
+  "lablab_plot_next_hybrid_maize", "lablab_plot_next_local_maize",
+  "hybrid_maize_variety_plot", "local_maize_variety_plot",
+  "hybrid_ombosh", "local_ombosh", "farmer_choice_vs_ombosh",
+  "hybrid_ombosh_plot", "local_ombosh_plot", "farmer_choice_vs_ombosh_Plot"
+)
+
+plot_planting_wide <- NULL
+if (any(grepl("^plot_planting_repeat", names(df)))) {
+  df <- df %>% mutate(.row_for_pp = row_number())
+  
+  pp_cols <- names(df)[grepl("^plot_planting_repeat_\\d+_", names(df))]
+  
+  pp_long <- df %>%
+    select(.row_for_pp, all_of(pp_cols)) %>%
+    pivot_longer(
+      cols = - .row_for_pp,
+      names_to = c("repeat_num", "field"),
+      names_pattern = "^plot_planting_repeat_(\\d+)_plot_planting_repeat_(.*)$",
+      values_to = "val"
+    ) %>%
+    pivot_wider(
+      id_cols = c(.row_for_pp, repeat_num),
+      names_from = field,
+      values_from = val
+    )
+  
+  # clean names and filter
+  pp_long <- pp_long %>%
+    filter(!is.na(plot_planting_name) & plot_planting_name != "" &
+             (!is.na(date_maize_planted) | !is.na(date_cover_crop_planted))) %>%
+    mutate(name_clean = make.names(tolower(str_trim(plot_planting_name)), unique = TRUE)) %>%
+    filter(name_clean %in% tolower(plot_planting_cols)) %>%
+    mutate(name_clean = case_when(
+      name_clean %in% make.names(tolower(plot_planting_cols)) ~ plot_planting_cols[match(name_clean, make.names(tolower(plot_planting_cols)))],
+      TRUE ~ name_clean
+    ))
+  
+  # Pivot maize dates
+  pp_maize <- pp_long %>%
+    group_by(.row_for_pp, name_clean) %>%
+    summarise(val = first(date_maize_planted), .groups = "drop") %>%
+    mutate(colname = paste0(name_clean, "_date_maize_planted")) %>%
+    pivot_wider(
+      id_cols = .row_for_pp,
+      names_from = colname,
+      values_from = val
+    )
+  
+  # Pivot cover crop dates
+  pp_cover <- pp_long %>%
+    group_by(.row_for_pp, name_clean) %>%
+    summarise(val = first(date_cover_crop_planted), .groups = "drop") %>%
+    mutate(colname = paste0(name_clean, "_date_cover_crop_planted")) %>%
+    pivot_wider(
+      id_cols = .row_for_pp,
+      names_from = colname,
+      values_from = val
+    )
+  
+  # Join maize and cover side by side
+  pp_w <- pp_maize %>%
+    left_join(pp_cover, by = ".row_for_pp")
+  
+  df <- df %>%
+    left_join(pp_w, by = ".row_for_pp") %>%
+    select(-.row_for_pp)
+} else {
+  df <- df %>% select(-.row_for_pp)
+}
+
+###################################
+##########################
+# --- STEP 7: Clean location_termite repeat groups into paired columns ---
+loc_name_cols <- grep("^location_termite_repeat_\\d+_location_termite_repeat_location_termite_name$", names(df), value = TRUE)
+loc_type_cols <- grep("^location_termite_repeat_\\d+_location_termite_repeat_termite_type_name$", names(df), value = TRUE)
+
+# safe emptyish checker
+is_emptyish <- function(x) {
+  if (is.na(x)) return(TRUE)
+  x <- tolower(str_trim(as.character(x)))
+  x == "" | x %in% c("none", "other") | grepl("^no\\b", x)
+}
+
+df <- df %>%
+  rowwise() %>%
+  mutate(
+    .loc_pairs = list({
+      locs <- c_across(any_of(loc_name_cols))
+      types <- c_across(any_of(loc_type_cols))
+      
+      out <- list()
+      for (j in seq_along(locs)) {
+        loc <- locs[j]
+        typ <- types[j]
+        
+        if (is_emptyish(loc) & is_emptyish(typ)) {
+          next
+        }
+        
+        out <- append(out, list(c(loc, typ)))
+      }
+      out
+    })
+  ) %>%
+  ungroup()
+
+max_pair <- if (nrow(df) > 0) max(lengths(df$.loc_pairs), 0) else 0
+
+if (max_pair > 0) {
+  for (i in seq_len(max_pair)) {
+    loc_col <- paste0("Location_Termite_Attack_", i)
+    typ_col <- paste0("Termite_Attacking_Location_", i)
+    
+    df[[loc_col]] <- sapply(df$.loc_pairs, function(p) if (length(p) >= i) p[[i]][1] else NA_character_)
+    df[[typ_col]] <- sapply(df$.loc_pairs, function(p) if (length(p) >= i) p[[i]][2] else NA_character_)
+  }
+}
+
+df <- df %>%
+  select(-any_of(c(".loc_pairs", loc_name_cols, loc_type_cols,
+                   "location_termite_repeat_count")))
+
+# --- STEP 8: Final re-order & select (safe) ---
+final_cols <- c(
+  "round_number", "today", "organization", "datacollector", "subcounty", "clusters",
+  "farmer_name", "farmer_id", "farmer_profile", "gender", "contact", "age_range",
+  "attended_workshop", "geolocation", "geolocation_1", "geolocation_2",
+  "termite_problem", "termite_serverity", "termite_type", "mound_proximity", "distance",
+  "termite_causing_damage", "mound_picture", "mound_termites", "termite_sample",
+  "sample_label", "signs_termite_attack", "location_termite_attack"
+)
+
+# add emergence cols
+em_cols_present <- names(df)[grepl("_week_2_emmergence$", names(df))]
+final_cols <- c(final_cols, em_cols_present)
+
+# add paired cols, side-by-side
+paired_cols <- unlist(lapply(seq_len(max_pair), function(i) {
+  c(paste0("Location_Termite_Attack_", i), paste0("Termite_Attacking_Location_", i))
+}))
+paired_cols <- paired_cols[paired_cols %in% names(df)]
+final_cols <- c(final_cols, paired_cols)
+# --- STEP 7: Clean location_termite repeat groups into paired columns ---
+loc_name_cols <- grep("^location_termite_repeat_\\d+_location_termite_repeat_location_termite_name$", names(df), value = TRUE)
+loc_type_cols <- grep("^location_termite_repeat_\\d+_location_termite_repeat_termite_type_name$", names(df), value = TRUE)
+
+# safe emptyish checker
+is_emptyish <- function(x) {
+  if (is.na(x)) return(TRUE)
+  x <- tolower(str_trim(as.character(x)))
+  x == "" | x %in% c("none", "other") | grepl("^no\\b", x)
+}
+
+df <- df %>%
+  rowwise() %>%
+  mutate(
+    .loc_pairs = list({
+      locs <- c_across(any_of(loc_name_cols))
+      types <- c_across(any_of(loc_type_cols))
+      
+      out <- list()
+      for (j in seq_along(locs)) {
+        loc <- locs[j]
+        typ <- types[j]
+        
+        if (is_emptyish(loc) & is_emptyish(typ)) {
+          next
+        }
+        
+        out <- append(out, list(c(loc, typ)))
+      }
+      out
+    })
+  ) %>%
+  ungroup()
+
+max_pair <- if (nrow(df) > 0) max(lengths(df$.loc_pairs), 0) else 0
+
+if (max_pair > 0) {
+  for (i in seq_len(max_pair)) {
+    loc_col <- paste0("Location_Termite_Attack_", i)
+    typ_col <- paste0("Termite_Attacking_Location_", i)
+    
+    df[[loc_col]] <- sapply(df$.loc_pairs, function(p) if (length(p) >= i) p[[i]][1] else NA_character_)
+    df[[typ_col]] <- sapply(df$.loc_pairs, function(p) if (length(p) >= i) p[[i]][2] else NA_character_)
+  }
+}
+
+df <- df %>%
+  select(-any_of(c(".loc_pairs", loc_name_cols, loc_type_cols,
+                   "location_termite_repeat_count")))
+
+# --- STEP 8: Final re-order & select (safe) ---
+final_cols <- c(
+  "round_number", "today", "organization", "datacollector", "subcounty", "clusters",
+  "farmer_name", "farmer_id", "farmer_profile", "gender", "contact", "age_range",
+  "attended_workshop", "geolocation", "geolocation_1", "geolocation_2",
+  "termite_problem", "termite_serverity", "termite_type", "mound_proximity", "distance",
+  "termite_causing_damage", "mound_picture", "mound_termites", "termite_sample",
+  "sample_label", "signs_termite_attack", "location_termite_attack"
+)
+
+# add emergence cols
+em_cols_present <- names(df)[grepl("_week_2_emmergence$", names(df))]
+final_cols <- c(final_cols, em_cols_present)
+
+# add paired cols, side-by-side
+paired_cols <- unlist(lapply(seq_len(max_pair), function(i) {
+  c(paste0("Location_Termite_Attack_", i), paste0("Termite_Attacking_Location_", i))
+}))
+paired_cols <- paired_cols[paired_cols %in% names(df)]
+final_cols <- c(final_cols, paired_cols)
+
+# build rest as needed
+rest_cols <- setdiff(names(df), final_cols)
+final_cols <- c(final_cols, rest_cols)
+
+
+df_clean <- df %>% select(any_of(final_cols))
+
+
+df_clean <- df_clean %>%
+  # Remove rows where signs_termite_attack starts with "no"
+  filter(!str_detect(tolower(signs_termite_attack), "^no")) %>%
+  # Convert to lowercase
+  mutate(signs_termite_attack = tolower(signs_termite_attack)) %>%
+  # First split on comma/semicolon only
+  separate_rows(signs_termite_attack, sep = "[,;]") %>%
+  # Trim spaces
+  mutate(signs_termite_attack = str_trim(signs_termite_attack)) %>%
+  # If underscores are present, split by spaces, else keep as is
+  mutate(signs_termite_attack = ifelse(
+    str_detect(signs_termite_attack, "_"),
+    gsub(" +", ";", signs_termite_attack),  # replace spaces with semicolon for splitting
+    signs_termite_attack
+  )) %>%
+  # Split again where we replaced spaces with semicolons
+  separate_rows(signs_termite_attack, sep = ";") %>%
+  mutate(signs_termite_attack = str_trim(signs_termite_attack)) %>%
+  # Treat invalid entries as NA
+  mutate(
+    signs_termite_attack = na_if(signs_termite_attack, "na"),
+    signs_termite_attack = na_if(signs_termite_attack, "n/a"),
+    signs_termite_attack = na_if(signs_termite_attack, "none"),
+    signs_termite_attack = ifelse(str_detect(signs_termite_attack, "^no"), NA, signs_termite_attack)
+  ) %>%
+  # Reshape back into wide form with suffixes
+  group_by(across(-signs_termite_attack)) %>%
+  mutate(col_id = row_number()) %>%
+  ungroup() %>%
+  pivot_wider(
+    names_from = col_id,
+    values_from = signs_termite_attack,
+    names_prefix = "Sign_Termite_Attack_"
+  ) %>%
+  relocate(starts_with("Sign_Termite_Attack_"), .before = starts_with("Location_Termite_Attack_"))
+
+df_clean <- df_clean %>% select(-any_of(c(
+  "location_termite_attack",
+  "location_termite_repeat_1_location_termite_repeat_location_termite_index",
+  "location_termite_repeat_1_location_termite_repeat_plant_attacked",
+  "location_termite_repeat_1_location_termite_repeat_termite_type_image",
+  "location_termite_repeat_2_location_termite_repeat_location_termite_index",
+  "location_termite_repeat_2_location_termite_repeat_plant_attacked",
+  "location_termite_repeat_2_location_termite_repeat_termite_type_image",
+  "location_termite_repeat_3_location_termite_repeat_location_termite_index",
+  "location_termite_repeat_3_location_termite_repeat_plant_attacked",
+  "location_termite_repeat_3_location_termite_repeat_termite_type_image",
+  "location_termite_repeat_4_location_termite_repeat_location_termite_index",
+  "location_termite_repeat_4_location_termite_repeat_plant_attacked",
+  "location_termite_repeat_4_location_termite_repeat_termite_type_image"    
+)))
+df_clean <- df_clean %>%
+  select(
+    -any_of(c(
+      "emmergence_repeat_1_emmergence_repeat_emmergence_index",                                      
+      "emmergence_repeat_1_emmergence_repeat_emmergence_name",                                       
+      "emmergence_repeat_1_emmergence_repeat_emmergence",                                            
+      "emmergence_repeat_2_emmergence_repeat_emmergence_index",                                     
+      "emmergence_repeat_2_emmergence_repeat_emmergence_name",                                      
+      "emmergence_repeat_2_emmergence_repeat_emmergence",                                           
+      "emmergence_repeat_3_emmergence_repeat_emmergence_index",                                      
+      "emmergence_repeat_3_emmergence_repeat_emmergence_name",                                      
+      "emmergence_repeat_3_emmergence_repeat_emmergence",                                           
+      "emmergence_repeat_4_emmergence_repeat_emmergence_index",                                      
+      "emmergence_repeat_4_emmergence_repeat_emmergence_name",                                      
+      "emmergence_repeat_4_emmergence_repeat_emmergence",
+      "tasseling_repeat_1_tasseling_repeat_tasseling_pop_index" ,                                    
+       "tasseling_repeat_1_tasseling_repeat_tasseling_pop_name",                                      
+       "tasseling_repeat_1_tasseling_repeat_pop_reduction_at_tasseling" ,                             
+      "tasseling_repeat_2_tasseling_repeat_tasseling_pop_index",                                     
+       "tasseling_repeat_2_tasseling_repeat_tasseling_pop_name" ,                                     
+       "tasseling_repeat_2_tasseling_repeat_pop_reduction_at_tasseling" ,                             
+       "tasseling_repeat_3_tasseling_repeat_tasseling_pop_index",                                     
+       "tasseling_repeat_3_tasseling_repeat_tasseling_pop_name" ,                                     
+       "tasseling_repeat_3_tasseling_repeat_pop_reduction_at_tasseling" ,                             
+       "tasseling_repeat_4_tasseling_repeat_tasseling_pop_index"  ,                                   
+       "tasseling_repeat_4_tasseling_repeat_tasseling_pop_name"  ,                                    
+       "tasseling_repeat_4_tasseling_repeat_pop_reduction_at_tasseling",                              
+       "loss_harvest_repeat_1_loss_harvest_repeat_loss_harvest_index" ,                               
+       "loss_harvest_repeat_1_loss_harvest_repeat_loss_harvest_name",                                 
+      "loss_harvest_repeat_1_loss_harvest_repeat_pop_harvesting"  ,                                  
+       "loss_harvest_repeat_2_loss_harvest_repeat_loss_harvest_index" ,                               
+       "loss_harvest_repeat_2_loss_harvest_repeat_loss_harvest_name" ,                                
+       "loss_harvest_repeat_2_loss_harvest_repeat_pop_harvesting"     ,                               
+      "loss_harvest_repeat_3_loss_harvest_repeat_loss_harvest_index"  ,                              
+       "loss_harvest_repeat_3_loss_harvest_repeat_loss_harvest_name"    ,                             
+       "loss_harvest_repeat_3_loss_harvest_repeat_pop_harvesting" ,
+      "vigour_repeat_1_vigour_repeat_plant_vigour_index"                ,                            
+       "vigour_repeat_1_vigour_repeat_plant_vigour_name"             ,                                
+       "vigour_repeat_1_vigour_repeat_plant_vigour_for_each_plot"     ,                               
+       "vigour_repeat_2_vigour_repeat_plant_vigour_index"              ,                              
+       "vigour_repeat_2_vigour_repeat_plant_vigour_name"               ,                              
+       "vigour_repeat_2_vigour_repeat_plant_vigour_for_each_plot"       ,                             
+       "vigour_repeat_3_vigour_repeat_plant_vigour_index"                ,                            
+       "vigour_repeat_3_vigour_repeat_plant_vigour_name"                  ,                           
+       "vigour_repeat_3_vigour_repeat_plant_vigour_for_each_plot"          ,                          
+       "vigour_repeat_4_vigour_repeat_plant_vigour_index"         ,                                   
+     "vigour_repeat_4_vigour_repeat_plant_vigour_name"           ,                                  
+       "vigour_repeat_4_vigour_repeat_plant_vigour_for_each_plot",
+     "plots_repeat_1_plots_repeat_plot_index" ,                                                     
+     "plots_repeat_1_plots_repeat_plot_name",                                                       
+      "plots_repeat_1_plots_repeat_plot_sizes",                                                      
+      "plots_repeat_2_plots_repeat_plot_index" ,                                                     
+      "plots_repeat_2_plots_repeat_plot_name"  ,                                                     
+      "plots_repeat_2_plots_repeat_plot_sizes"  ,                                                    
+      "plots_repeat_3_plots_repeat_plot_index"   ,                                                   
+      "plots_repeat_3_plots_repeat_plot_name"     ,                                                  
+      "plots_repeat_3_plots_repeat_plot_sizes"     ,                                                 
+      "plots_repeat_4_plots_repeat_plot_index"      ,                                                
+      "plots_repeat_4_plots_repeat_plot_name"        ,                                               
+      "plots_repeat_4_plots_repeat_plot_sizes",
+     "plots_weeded_repeat_1_plots_weeded_repeat_plots_weeded_index" ,                               
+      "plots_weeded_repeat_1_plots_weeded_repeat_plots_weeded_name",                                 
+      "plots_weeded_repeat_1_plots_weeded_repeat_plot_weeding_date" ,                                
+      "plots_weeded_repeat_2_plots_weeded_repeat_plots_weeded_index",                                
+      "plots_weeded_repeat_2_plots_weeded_repeat_plots_weeded_name",                                 
+      "plots_weeded_repeat_2_plots_weeded_repeat_plot_weeding_date" ,                                
+      "plots_weeded_repeat_3_plots_weeded_repeat_plots_weeded_index",                                
+      "plots_weeded_repeat_3_plots_weeded_repeat_plots_weeded_name"  ,                               
+      "plots_weeded_repeat_3_plots_weeded_repeat_plot_weeding_date"   ,                              
+      "plots_weeded_repeat_4_plots_weeded_repeat_plots_weeded_index" ,                               
+      "plots_weeded_repeat_4_plots_weeded_repeat_plots_weeded_name"  ,                               
+      "plots_weeded_repeat_4_plots_weeded_repeat_plot_weeding_date" ,
+     "first_weeding_repaet_1_first_weeding_repaet_first_weeding_index",                             
+     "first_weeding_repaet_1_first_weeding_repaet_first_weeding_name" ,                             
+     "first_weeding_repaet_1_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+     "first_weeding_repaet_2_first_weeding_repaet_first_weeding_index"  ,                           
+     "first_weeding_repaet_2_first_weeding_repaet_first_weeding_name" ,                             
+     "first_weeding_repaet_2_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+     "first_weeding_repaet_3_first_weeding_repaet_first_weeding_index" ,                            
+     "first_weeding_repaet_3_first_weeding_repaet_first_weeding_name" ,                             
+     "first_weeding_repaet_3_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+     "first_weeding_repaet_4_first_weeding_repaet_first_weeding_index",                             
+     "first_weeding_repaet_4_first_weeding_repaet_first_weeding_name" ,                             
+     "first_weeding_repaet_4_first_weeding_repaet_reduction_in_plot_population_after_first_weeding",
+     "second_weeding_repeat_1_second_weeding_repeat_second_weeding_index"  ,                
+      "second_weeding_repeat_1_second_weeding_repeat_second_weeding_name",                   
+      "second_weeding_repeat_1_second_weeding_repeat_plot_reduced_pop_after_second_weeding", 
+      "second_weeding_repeat_2_second_weeding_repeat_second_weeding_index" ,                 
+      "second_weeding_repeat_2_second_weeding_repeat_second_weeding_name"   ,                
+      "second_weeding_repeat_2_second_weeding_repeat_plot_reduced_pop_after_second_weeding", 
+      "second_weeding_repeat_3_second_weeding_repeat_second_weeding_index"                 , 
+      "second_weeding_repeat_3_second_weeding_repeat_second_weeding_name"                   ,
+      "second_weeding_repeat_3_second_weeding_repeat_plot_reduced_pop_after_second_weeding" ,
+      "second_weeding_repeat_4_second_weeding_repeat_second_weeding_index" ,                 
+      "second_weeding_repeat_4_second_weeding_repeat_second_weeding_name" ,                  
+      "second_weeding_repeat_4_second_weeding_repeat_plot_reduced_pop_after_second_weeding" ,
+     "plots_second_weeding_repeat_1_plots_second_weeding_repeat_plots_second_weeding_index",
+     "plot_planting_repeat_1_plot_planting_repeat_plot_planting_index",                                               
+     "plot_planting_repeat_1_plot_planting_repeat_plot_planting_name",                                                
+     "plot_planting_repeat_1_plot_planting_repeat_date_maize_planted" ,                                               
+     "plot_planting_repeat_1_plot_planting_repeat_date_cover_crop_planted",                                           
+     "plot_planting_repeat_2_plot_planting_repeat_plot_planting_index"    ,                                           
+     "plot_planting_repeat_2_plot_planting_repeat_plot_planting_name"      ,                                          
+     "plot_planting_repeat_2_plot_planting_repeat_date_maize_planted"       ,                                         
+     "plot_planting_repeat_2_plot_planting_repeat_date_cover_crop_planted"   ,                                        
+     "plot_planting_repeat_3_plot_planting_repeat_plot_planting_index"        ,                                       
+     "plot_planting_repeat_3_plot_planting_repeat_plot_planting_name"          ,                                      
+     "plot_planting_repeat_3_plot_planting_repeat_date_maize_planted"           ,                                     
+     "plot_planting_repeat_3_plot_planting_repeat_date_cover_crop_planted"    ,                                       
+     "plot_planting_repeat_4_plot_planting_repeat_plot_planting_index"         ,                                      
+     "plot_planting_repeat_4_plot_planting_repeat_plot_planting_name"           ,                                     
+     "plot_planting_repeat_4_plot_planting_repeat_date_maize_planted"            ,                                    
+     "plot_planting_repeat_4_plot_planting_repeat_date_cover_crop_planted",
+     "mound_picture",
+     "plots_repeat_count",
+     "emmergence_repeat_count",
+     "plots_weeded_repeat_count",
+     "first_weeding_repaet_count",
+     "plots_second_weeding_repeat_count",                       
+     "second_weeding_repeat_count",
+     "tasseling_repeat_count",
+     "vigour_repeat_count",
+     "plot_planting_repeat_count",
+     "plant_vigour_by_plot"
+    ))
+  )
+###########
+##Reorder colnames
+library(dplyr)
+
+df_clean <- df_clean %>%
+  select(
+#Farmer Profile
+round_number,
+today,
+organization,
+datacollector,
+subcounty,
+clusters,
+farmer_name,
+farmer_id,
+farmer_profile,
+gender,contact,
+age_range,
+attended_workshop,
+
+#Site data
+site_data,
+geolocation,
+geolocation_1,
+geolocation_2,
+
+
+#Trials
+trial_setup,
+trials,
+local_maize_planted,
+hybrid_maize_planted,
+trial_plots_established,                                 
+trial_plot_farmer_choice,
+
+#Plot Details
+plot_details,
+plots, 
+plot_size_same,
+general_plot_size,                                      
+farmer_choice_vs_ombosh_Plot_size,                       
+lablab_plot_next_local_size,                            
+local_maize_size,                                        
+lablab_plot_next_hybrid_size,                            
+farmer_choice_plot_size,                                 
+hybrid_plot_size,                                        
+lablab_plot_size,                                       
+local_maize_plot_size,                                   
+hybrid_ombosh_plot_size,                                 
+hybrid_maize_size,
+   
+#termite Problem
+termite_problem,
+termite_serverity,
+termite_type,
+mound_proximity,distance,                                                
+termite_causing_damage,
+mound_termites,
+termite_sample,
+sample_label,                                            
+Sign_Termite_Attack_1,
+Sign_Termite_Attack_2,
+Sign_Termite_Attack_3,                                  
+Location_Termite_Attack_1,
+Termite_Attacking_Location_1,
+Location_Termite_Attack_2,
+Termite_Attacking_Location_2,
+Location_Termite_Attack_3,
+Termite_Attacking_Location_3,
+Location_Termite_Attack_4,
+Termite_Attacking_Location_4,
+
+#Striga problem
+striga,
+striga_info,
+
+#Plot planting date
+planting_date_same,
+plot_planting_date, 
+actual_maize_planting_date,
+actual_covercrop_planting_date,
+local_ombosh_plot_date_maize_planted,
+farmer_choice_plot_date_maize_planted,                   
+hybrid_plot_date_maize_planted,
+lablab_plot_date_maize_planted,                          
+local_maize_plot_date_maize_planted,
+farmer_choice_vs_ombosh_Plot_date_maize_planted,         
+hybrid_maize_date_maize_planted,
+lablab_plot_next_hybrid_date_maize_planted,              
+lablab_plot_next_local_date_maize_planted,
+local_maize_date_maize_planted,                          
+local_ombosh_plot_date_cover_crop_planted,
+farmer_choice_plot_date_cover_crop_planted,             
+hybrid_plot_date_cover_crop_planted,
+lablab_plot_date_cover_crop_planted,                     
+local_maize_plot_date_cover_crop_planted,
+farmer_choice_vs_ombosh_Plot_date_cover_crop_planted,    
+hybrid_maize_date_cover_crop_planted,
+lablab_plot_next_hybrid_date_cover_crop_planted,         
+lablab_plot_next_local_date_cover_crop_planted,
+local_maize_date_cover_crop_planted,
+
+#emmergence
+emmergence_same,
+week_2_emmergence_overall,
+hybrid_maize_week_2_emmergence,                          
+lablab_plot_next_hybrid_week_2_emmergence,
+lablab_plot_next_local_week_2_emmergence,                
+local_maize_week_2_emmergence,
+farmer_choice_plot_week_2_emmergence,
+hybrid_plot_week_2_emmergence,                           
+lablab_plot_week_2_emmergence,
+local_maize_plot_week_2_emmergence,
+hybrid_ombosh_plot_week_2_emmergence,                    
+local_ombosh_plot_week_2_emmergence,
+farmer_choice_vs_ombosh_Plot_week_2_emmergence,         
+
+#First weeding
+first_weed_data,
+first_weeding_same,
+first_weeding_date,
+first_weeding_date_001,
+plots_weeded,
+farmer_choice_vs_ombosh_Plot_weeding_date,               
+lablab_plot_next_local_weeding_date,                     
+local_maize_weeding_date,                                
+hybrid_maize_weeding_date,                              
+lablab_plot_next_hybrid_weeding_date,                    
+lablab_plot_weeding_date,                                
+hybrid_plot_weeding_date,                                
+local_maize_plot_weeding_date,                           
+hybrid_ombosh_plot_weeding_date,                         
+local_ombosh_plot_weeding_date,                         
+farmer_choice_plot_weeding_date, 
+
+#First weeding pop reduction
+
+plot_reduced_pop_after_first_weeding,
+reduction_after_first_weeding,                           
+hybrid_plot_First_weeding_pop_reduction,
+hybrid_ombosh_plot_First_weeding_pop_reduction,          
+local_ombosh_plot_First_weeding_pop_reduction,
+farmer_choice_vs_ombosh_Plot_First_weeding_pop_reduction,
+lablab_plot_next_local_First_weeding_pop_reduction,
+local_maize_First_weeding_pop_reduction,                 
+hybrid_maize_First_weeding_pop_reduction,
+farmer_choice_plot_First_weeding_pop_reduction,          
+lablab_plot_next_hybrid_First_weeding_pop_reduction,     
+local_maize_plot_First_weeding_pop_reduction,            
+lablab_plot_First_weeding_pop_reduction, 
+
+#Second weeding                        
+                             
+second_weeding_data,                                    
+second_weeding,                                          
+second_weeding_same,                                     
+plot_second_weeding,                                     
+reduction_after_second_weeding,                          
+hybrid_plot_second_weeding_pop_reduction,                
+farmer_choice_plot_second_weeding_pop_reduction,         
+lablab_plot_second_weeding_pop_reduction,                
+local_maize_plot_second_weeding_pop_reduction,
+
+#Tasseling data
+tasseling_data,                                         
+reduction_at_tasseling,                                  
+plot_reduced_pop_at_tasseling,                           
+hybrid_ombosh_plot_tasseling_pop_reduction,              
+local_ombosh_plot_tasseling_pop_reduction,               
+lablab_plot_next_local_tasseling_pop_reduction,          
+local_maize_tasseling_pop_reduction,                    
+hybrid_plot_tasseling_pop_reduction,                    
+hybrid_maize_tasseling_pop_reduction,                    
+lablab_plot_next_hybrid_tasseling_pop_reduction,        
+farmer_choice_plot_tasseling_pop_reduction,              
+local_maize_plot_tasseling_pop_reduction,                
+lablab_plot_tasseling_pop_reduction,
+
+#Harvest Data
+data_harvest,                                            
+plant_loss_at_harvest,                                   
+plot_reduced_pop_at_harvest,                             
+stage_most_plants_lost,                                  
+loss_harvest_repeat_count,                               
+local_maize_plot_pop_harvesting,                         
+hybrid_plot_pop_harvesting,                              
+farmer_choice_plot_pop_harvesting,                       
+lablab_plot_next_hybrid_pop_harvesting,                  
+lablab_plot_next_local_pop_harvesting,
+
+#Plant Vigour
+farmer_choice_plot_Plant_Vigour,                         
+hybrid_plot_Plant_Vigour,                                
+lablab_plot_Plant_Vigour,                                
+local_maize_plot_Plant_Vigour,                           
+hybrid_maize_Plant_Vigour,                               
+lablab_plot_next_hybrid_Plant_Vigour,                    
+lablab_plot_next_local_Plant_Vigour,                     
+local_maize_Plant_Vigour,                               
+hybrid_ombosh_plot_Plant_Vigour,                         
+local_ombosh_plot_Plant_Vigour,                          
+farmer_choice_vs_ombosh_Plot_Plant_Vigour,
+
+#Moisture stress
+moisture_stress,                                         
+moisture_stress_period, 
+
+#Fertilizer
+used_compost,                                            
+compost_used,                                            
+supplementary_fertilizer_used,  
+
+#Biopesticide
+biopesticide_use,                                       
+where_biopesticide_applied,
+
+#practice CA/Pests/Diseases
+prcatice_ca,  
+pests_diseases,
+ 
+# Keep anything else not explicitly ordered at the end
+everything()
+  )
+# --- Final cleaned dataset ---
+RFRN_Tembea_Cleaned_Termite_Data <- df_clean
+library(dplyr)
+
+RFRN_Tembea_Cleaned_Termite_Data <- RFRN_Tembea_Cleaned_Termite_Data %>%
+  mutate(
+    farmer_name = coalesce(farmer_name, farmer_name_other)
+  ) %>%
+  select(-farmer_name_other)   # Remove helper column
+
+RFRN_Tembea_Cleaned_Termite_Data <- RFRN_Tembea_Cleaned_Termite_Data %>%
+  mutate(across(c(organization, subcounty, clusters, farmer_name), as.character)) %>%
+  arrange(organization, subcounty, clusters, farmer_name)
+
+cat("Final columns (in order):\n")
+View(RFRN_Tembea_Cleaned_Termite_Data)
