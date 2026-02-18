@@ -1,0 +1,41 @@
+# Load required library
+library(dplyr)
+
+# Load your data (adjust filename as needed)
+df <- read.csv("your_file.csv")
+
+# Step 1: Standardize text columns (helps avoid issues with spaces or capitalization)
+df_clean <- df %>%
+  mutate(across(where(is.character), ~ trimws(tolower(.x))))
+
+# Step 2: Identify potential duplicates based on farmer_name + round_number + datacollector
+potential_duplicates <- df_clean %>%
+  group_by(farmer_name, round_number, datacollector) %>%
+  mutate(group_count = n()) %>%
+  ungroup() %>%
+  filter(group_count > 1)
+
+# Step 3: Among these, identify truly identical rows (across all columns)
+exact_duplicates <- potential_duplicates %>%
+  group_by(across(everything())) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+# Step 4: Flag duplicates in main dataset
+df_flagged <- df_clean %>%
+  group_by(across(everything())) %>%
+  mutate(is_duplicate = n() > 1) %>%
+  ungroup()
+
+# Step 5: Remove exact duplicates, keeping one copy of each
+df_nodup <- df_clean %>%
+  distinct()
+
+# Step 6: Save outputs
+write.csv(exact_duplicates, "duplicates_found.csv", row.names = FALSE)
+write.csv(df_nodup, "cleaned_no_duplicates.csv", row.names = FALSE)
+
+# Optional: quick summary
+cat("✅ Duplicate rows found:", nrow(exact_duplicates), "\n")
+cat("✅ Cleaned dataset saved as: cleaned_no_duplicates.csv\n")
+cat("✅ Duplicate records saved as: duplicates_found.csv\n")
