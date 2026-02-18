@@ -1,0 +1,27 @@
+library(dplyr)
+
+farmer_list <- termite_data %>%
+  group_by(farmer_name, clusters) %>%
+  arrange(today) %>%
+  summarise(
+    organization       = first(na.omit(organization)),
+    subcounty          = first(na.omit(subcounty)),
+    gender             = first(na.omit(gender)),
+    age_range          = first(na.omit(age_range)),
+    contact            = first(na.omit(contact)),
+    attended_workshop  = first(na.omit(attended_workshop)),
+    .groups = "drop"
+  ) %>%
+  # remove unwanted rows
+  filter(
+    !is.na(farmer_name),
+    !tolower(farmer_name) %in% c("korwa_a","naora")
+  ) %>%
+  arrange(organization, subcounty, clusters, farmer_name)
+
+# View clean result
+print(farmer_list)
+
+# View result
+print(farmer_list)
+View(farmer_list)
